@@ -24,7 +24,7 @@
 
 #### 表设计
 
-`accounts` 保存密码哈希、当前 Access Token、Refresh Token、`session_id` 和 `refresh_expires_at`。Refresh Token 建立查询索引，过期判断使用数据库 UTC 时间。新登录替换会话，刷新保持会话标识，登出按会话条件清空凭证。
+`accounts` 保存密码哈希、当前 Access Token、Refresh Token、`session_id` 和 `refresh_expires_at`。Refresh Token 建立查询索引，过期判断使用数据库 UTC 时间。新登录替换会话，刷新保持会话标识，登出按会话条件清空凭证。刷新在事务中加行锁并读取最新用户名；当前 Access Token 剩余有效期超过 1 分钟时复用，否则重新签发，使多个页面或 API 实例共享刷新结果。
 
 #### 相关方法
 
@@ -32,7 +32,7 @@
 | ----------------- | ------------------------------------------------------------ | ---------------------------------------------- | ----------------- | ------------------------------------------------------------ |
 | Handler           | POST `/account/register`                                     | `{username,password}` -> `{account}`           | MySQL ✅           | 注册账号；密码 bcrypt 哈希入库。                             |
 | Handler           | POST `/account/login`                                        | `{username,password}` -> `{token,refresh_token}` | MySQL ✅ | 事务内创建随机 SessionID，保存双 Token 与 7 天刷新过期时间，关闭旧会话连接。 |
-| Handler           | POST `/account/refresh`                                      | `{refresh_token}` -> `{token}`                 | MySQL ✅ | 按索引查询并条件更新；同时校验会话、凭证和数据库过期时间。 |
+| Handler           | POST `/account/refresh`                                      | `{refresh_token}` -> `{token}`                 | MySQL ✅ | 索引查询后锁住当前会话并复核凭证、过期时间；按最新用户名复用或签发 Token，避免并发刷新与改名冲突。 |
 | Handler           | POST `/account/changePassword`                               | `{username,old_password,new_password}` -> `{}` | MySQL ✅ | 同一事务内修改密码和撤销会话，防止旧密码校验结果重新建立登录态。 |
 | Handler           | POST `/account/findByID`                                     | `{id}` -> `{account}`                          | MySQL ✅           | 按 ID 查用户。                                               |
 | Handler           | POST `/account/findByUsername`                               | `{username}` -> `{account}`                    | MySQL ✅           | 按用户名查用户（前端常用保存 accountId/vloggerId）。         |

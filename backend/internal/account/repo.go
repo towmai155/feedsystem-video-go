@@ -116,11 +116,36 @@ func (ar *AccountRepository) FindByRefreshToken(ctx context.Context, token strin
 	return &account, err
 }
 
-func (ar *AccountRepository) RefreshSession(ctx context.Context, snapshot *Account, token string) error {
-	return requireSessionUpdate(ar.db.WithContext(ctx).Model(&Account{}).
-		Where("id = ? AND session_id = ? AND refresh_token = ? AND username = ? AND refresh_expires_at > UTC_TIMESTAMP(6)",
-			snapshot.ID, snapshot.SessionID, snapshot.RefreshToken, snapshot.Username).
-		Update("token", token))
+// RefreshSession rechecks the session under a row lock. The token callback sees
+// the latest username and access token, including a concurrent rename/refresh.
+// Keep token selection inside the transaction so API instances share one result.
+func (ar *AccountRepository) RefreshSession(ctx context.Context, snapshot *Account, tokenForCurrent func(*Account) (string, error)) (*Account, error) {
+	var current Account
+	err := ar.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Select("id", "username", "session_id", "token", "refresh_token").
+			Where("id = ? AND session_id = ? AND refresh_token = ? AND token <> '' AND refresh_expires_at > UTC_TIMESTAMP(6)",
+				snapshot.ID, snapshot.SessionID, snapshot.RefreshToken).
+			First(&current).Error; err != nil {
+			return err
+		}
+		token, err := tokenForCurrent(&current)
+		if err != nil {
+			return err
+		}
+		if token == current.Token {
+			return nil
+		}
+		if err := requireSessionUpdate(tx.Model(&Account{}).
+			Where("id = ? AND session_id = ? AND refresh_token = ? AND refresh_expires_at > UTC_TIMESTAMP(6)",
+				current.ID, current.SessionID, current.RefreshToken).
+			Update("token", token)); err != nil {
+			return err
+		}
+		current.Token = token
+		return nil
+	})
+	return &current, err
 }
 
 func requireSessionUpdate(result *gorm.DB) error {

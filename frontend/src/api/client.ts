@@ -47,7 +47,10 @@ function tryRefresh(): Promise<string | null> {
     const data = await handleResponse<{ token: string }>(res, '/account/refresh', snapshot)
     // A response from a previous session must not restore a logged-out user or
     // overwrite credentials established by a newer login/rename.
-    if (!isCurrent(snapshot)) return null
+    if (!isCurrent(snapshot)) {
+      const auth = useAuthStore()
+      return auth.refreshToken === refreshToken ? auth.token : null
+    }
     useAuthStore().setToken(data.token)
     return data.token
   }).finally(() => {
@@ -58,27 +61,28 @@ function tryRefresh(): Promise<string | null> {
 }
 
 async function send<T>(path: string, body: BodyInit, headers: Record<string, string>, options?: RequestOptions): Promise<T> {
-  const snapshot = snapshotAuth()
+  let snapshot = snapshotAuth()
   if (options?.authRequired && !snapshot.token) {
     throw new ApiError('需要先登录（缺少 token）', 401)
   }
-  if (snapshot.token && !credentialEndpoints.has(path) && path !== '/account/refresh') {
-    headers.Authorization = `Bearer ${snapshot.token}`
-  }
-  const res = await fetch(`${API_BASE}${path}`, { method: 'POST', headers, body })
-
-  if (res.status === 401 && path !== '/account/refresh' && !credentialEndpoints.has(path) &&
-      snapshot.refreshToken && useAuthStore().refreshToken === snapshot.refreshToken) {
+  const canRefresh = path !== '/account/refresh' && !credentialEndpoints.has(path)
+  // A rename may replace the access token after refresh commits but before the
+  // retry arrives. Allow one more recovery, while bounding all request retries.
+  const maxAuthRetries = 2
+  for (let attempt = 0; ; attempt += 1) {
+    if (snapshot.token && canRefresh) headers.Authorization = `Bearer ${snapshot.token}`
+    const res = await fetch(`${API_BASE}${path}`, { method: 'POST', headers, body })
+    if (res.status !== 401 || !canRefresh || attempt >= maxAuthRetries ||
+        !snapshot.refreshToken || useAuthStore().refreshToken !== snapshot.refreshToken) {
+      return handleResponse<T>(res, path, snapshot)
+    }
     const auth = useAuthStore()
     const newToken = auth.token !== snapshot.token ? auth.token : await tryRefresh()
-    if (newToken && useAuthStore().refreshToken === snapshot.refreshToken) {
-      const retrySnapshot = snapshotAuth()
-      headers.Authorization = `Bearer ${newToken}`
-      const retryRes = await fetch(`${API_BASE}${path}`, { method: 'POST', headers, body })
-      return handleResponse<T>(retryRes, path, retrySnapshot)
+    if (!newToken || useAuthStore().refreshToken !== snapshot.refreshToken) {
+      return handleResponse<T>(res, path, snapshot)
     }
+    snapshot = snapshotAuth()
   }
-  return handleResponse<T>(res, path, snapshot)
 }
 
 export function postJson<T>(path: string, body: unknown, options?: RequestOptions): Promise<T> {
@@ -96,7 +100,10 @@ async function handleResponse<T>(res: Response, path: string, snapshot: AuthSnap
     try { data = JSON.parse(text) } catch { data = text }
   }
   if (!res.ok) {
-    if (res.status === 401 && !credentialEndpoints.has(path) && isCurrent(snapshot)) {
+    // An access-token rejection can be a concurrent rename. Only a rejected
+    // refresh credential (or an account without one) establishes logout here.
+    if (res.status === 401 && !credentialEndpoints.has(path) &&
+        (path === '/account/refresh' || !snapshot.refreshToken) && isCurrent(snapshot)) {
       useAuthStore().clearTokens()
     }
     const msg = data && typeof data === 'object' && (data as ApiErrorBody).error

@@ -11,13 +11,16 @@ import (
 	"feedsystem_video_go/internal/auth"
 	"feedsystem_video_go/internal/testutil"
 
+	"github.com/golang-jwt/jwt/v5"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 )
 
+const testJWTSecret = "test-signing-key"
+
 func sessionFixture(t *testing.T) (*AccountRepository, *AccountService, *SessionValidator) {
 	t.Helper()
-	t.Setenv("JWT_SECRET", "test-signing-key")
+	t.Setenv("JWT_SECRET", testJWTSecret)
 	db := testutil.NewMySQL(t)
 	if err := db.AutoMigrate(&Account{}); err != nil {
 		t.Fatal(err)
@@ -44,6 +47,23 @@ func loginForTest(t *testing.T, service *AccountService) (LoginResponse, *auth.C
 		t.Fatal(err)
 	}
 	return login, claims
+}
+
+func setAccessTokenExpiry(t *testing.T, repo *AccountRepository, token string, expiresAt time.Time) string {
+	t.Helper()
+	claims, err := auth.ParseToken(token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims.ExpiresAt = jwt.NewNumericDate(expiresAt)
+	token, err = jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(testJWTSecret))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.db.Model(&Account{}).Where("id = ?", claims.AccountID).Update("token", token).Error; err != nil {
+		t.Fatal(err)
+	}
+	return token
 }
 
 func waitResult[T any](t *testing.T, ch <-chan T) T {
@@ -95,12 +115,20 @@ func TestSessionLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if token != login.Token {
+		t.Fatal("refresh replaced a still-current access token")
+	}
+	expired := setAccessTokenExpiry(t, repo, token, time.Now().Add(-time.Minute))
+	token, _, _, err = service.RefreshAccessToken(ctx, login.RefreshToken)
+	if err != nil {
+		t.Fatal(err)
+	}
 	refreshed, err := auth.ParseToken(token)
 	if err != nil || refreshed.SessionID != claims.SessionID {
 		t.Fatalf("refresh changed session: %v", err)
 	}
-	if _, err := validator.ValidateAccessToken(ctx, login.Token); !errors.Is(err, apierror.ErrUnauthorized) {
-		t.Fatal("superseded access token accepted")
+	if _, err := validator.ValidateAccessToken(ctx, expired); !errors.Is(err, apierror.ErrUnauthorized) {
+		t.Fatal("expired access token accepted")
 	}
 	if _, err := validator.ValidateAccessToken(ctx, token); err != nil {
 		t.Fatal(err)
@@ -122,6 +150,131 @@ func TestSessionLifecycle(t *testing.T) {
 	}
 	if current.Token != "" || current.SessionID != "" || current.RefreshToken != "" || current.RefreshExpiresAt != nil {
 		t.Fatal("session not fully revoked")
+	}
+}
+
+func TestConcurrentRefreshAcrossServicesReturnsSameToken(t *testing.T) {
+	for _, lifetime := range []time.Duration{-time.Minute, 30 * time.Second} {
+		t.Run(lifetime.String(), func(t *testing.T) {
+			repo, service, validator := sessionFixture(t)
+			login, claims := loginForTest(t, service)
+			previousToken := setAccessTokenExpiry(t, repo, login.Token, time.Now().Add(lifetime))
+			before, err := repo.FindByID(context.Background(), login.AccountID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Separate services share only MySQL, as separate API instances do.
+			other := NewAccountService(NewAccountRepository(repo.db.Session(&gorm.Session{})), nil)
+			services := []*AccountService{service, other}
+			type refreshResult struct {
+				token, username string
+				id              uint
+				err             error
+			}
+			const requests = 8
+			start := make(chan struct{})
+			results := make(chan refreshResult, requests)
+			for i := 0; i < requests; i++ {
+				go func(svc *AccountService) {
+					<-start
+					token, id, username, err := svc.RefreshAccessToken(context.Background(), login.RefreshToken)
+					results <- refreshResult{token: token, id: id, username: username, err: err}
+				}(services[i%len(services)])
+			}
+			close(start)
+			var sharedToken string
+			for i := 0; i < requests; i++ {
+				result := waitResult(t, results)
+				if result.err != nil {
+					t.Errorf("concurrent refresh failed: %v", result.err)
+					continue
+				}
+				if sharedToken == "" {
+					sharedToken = result.token
+				}
+				if result.token != sharedToken || result.id != login.AccountID || result.username != login.Username {
+					t.Error("concurrent callers did not receive the same current credentials")
+				}
+			}
+			if sharedToken == previousToken {
+				t.Fatal("expired or nearly expired access token was reused")
+			}
+			if current, err := validator.ValidateAccessToken(context.Background(), sharedToken); err != nil || current.SessionID != claims.SessionID {
+				t.Fatalf("successful refresh response is unusable: %v", err)
+			}
+			after, err := repo.FindByID(context.Background(), login.AccountID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if after.RefreshToken != login.RefreshToken || after.SessionID != claims.SessionID || !after.RefreshExpiresAt.Equal(*before.RefreshExpiresAt) {
+				t.Fatal("refresh changed the session or extended the refresh credential lifetime")
+			}
+		})
+	}
+}
+
+func TestPendingRefreshReusesResultFromAnotherService(t *testing.T) {
+	repo, service, validator := sessionFixture(t)
+	login, _ := loginForTest(t, service)
+	setAccessTokenExpiry(t, repo, login.Token, time.Now().Add(-time.Minute))
+	ctx, started, release := pauseRefreshRead(t, repo.db)
+	type refreshResult struct {
+		token string
+		err   error
+	}
+	result := make(chan refreshResult, 1)
+	go func() {
+		token, _, _, err := service.RefreshAccessToken(ctx, login.RefreshToken)
+		result <- refreshResult{token: token, err: err}
+	}()
+	waitResult(t, started)
+	other := NewAccountService(NewAccountRepository(repo.db.Session(&gorm.Session{})), nil)
+	current, _, _, err := other.RefreshAccessToken(context.Background(), login.RefreshToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
+	pending := waitResult(t, result)
+	if pending.err != nil || pending.token != current {
+		t.Fatalf("pending refresh superseded a successful response: %v", pending.err)
+	}
+	if _, err := validator.ValidateAccessToken(context.Background(), current); err != nil {
+		t.Fatalf("successful refresh response became unusable: %v", err)
+	}
+}
+
+func TestPendingRefreshUsesLatestRenamedSession(t *testing.T) {
+	for _, username := range []string{"renamed", "Tester"} {
+		t.Run(username, func(t *testing.T) {
+			repo, service, validator := sessionFixture(t)
+			login, claims := loginForTest(t, service)
+			ctx, started, release := pauseRefreshRead(t, repo.db)
+			type refreshResult struct {
+				token, username string
+				err             error
+			}
+			result := make(chan refreshResult, 1)
+			go func() {
+				token, _, name, err := service.RefreshAccessToken(ctx, login.RefreshToken)
+				result <- refreshResult{token: token, username: name, err: err}
+			}()
+			waitResult(t, started)
+			renamedToken, err := service.Rename(context.Background(), login.AccountID, claims.SessionID, username)
+			if err != nil {
+				t.Fatal(err)
+			}
+			release()
+			refreshed := waitResult(t, result)
+			if refreshed.err != nil || refreshed.token != renamedToken || refreshed.username != username {
+				t.Fatalf("refresh did not use the renamed session: username=%q err=%v", refreshed.username, refreshed.err)
+			}
+			if current, err := validator.ValidateAccessToken(context.Background(), refreshed.token); err != nil || current.Username != username || current.SessionID != claims.SessionID {
+				t.Fatalf("renamed refresh response is unusable: %v", err)
+			}
+			if _, err := validator.ValidateAccessToken(context.Background(), login.Token); !errors.Is(err, apierror.ErrUnauthorized) {
+				t.Fatal("rename did not invalidate its previous access token")
+			}
+		})
 	}
 }
 
@@ -268,6 +421,9 @@ func TestSessionWriteFailuresArePropagated(t *testing.T) {
 		t.Run(operation, func(t *testing.T) {
 			repo, service, validator := sessionFixture(t)
 			login, claims := loginForTest(t, service)
+			if operation == "refresh" {
+				login.Token = setAccessTokenExpiry(t, repo, login.Token, time.Now().Add(30*time.Second))
+			}
 			revocations := 0
 			service.onSessionRevoked = func(uint, string) { revocations++ }
 			if err := repo.db.Callback().Update().Before("gorm:update").Register("test:fail_update", func(tx *gorm.DB) { tx.AddError(errors.New("injected database write failure")) }); err != nil {
@@ -306,7 +462,7 @@ func TestSessionWriteFailuresArePropagated(t *testing.T) {
 }
 
 func TestExistingAccountMigrationRequiresLoginAndAddsRefreshIndex(t *testing.T) {
-	t.Setenv("JWT_SECRET", "test-signing-key")
+	t.Setenv("JWT_SECRET", testJWTSecret)
 	db := testutil.NewMySQL(t)
 	if err := db.Exec(`CREATE TABLE accounts (
 		id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,

@@ -18,6 +18,9 @@ import (
 
 const RefreshTokenTTL = 7 * 24 * time.Hour
 
+// Avoid returning a token that will expire while the caller retries its request.
+const refreshReuseMinTTL = time.Minute
+
 type AccountService struct {
 	accountRepository *AccountRepository
 	onSessionRevoked  func(uint, string)
@@ -156,14 +159,26 @@ func (as *AccountService) RefreshAccessToken(ctx context.Context, refreshToken s
 	if subtle.ConstantTimeCompare([]byte(account.RefreshToken), []byte(refreshToken)) != 1 {
 		return "", 0, "", apierror.ErrUnauthorized
 	}
-	token, err := auth.GenerateToken(account.ID, account.Username, account.SessionID)
-	if err != nil {
-		return "", 0, "", err
+	var tokenErr error
+	current, err := as.accountRepository.RefreshSession(ctx, account, func(current *Account) (string, error) {
+		claims, err := auth.ParseToken(current.Token)
+		if err == nil && claims.AccountID == current.ID && claims.SessionID == current.SessionID &&
+			claims.Username == current.Username && time.Until(claims.ExpiresAt.Time) > refreshReuseMinTTL {
+			return current.Token, nil
+		}
+		// A newly issued token is reused by the next refresh, even when requests
+		// come from different browser tabs or different API instances.
+		token, err := auth.GenerateToken(current.ID, current.Username, current.SessionID)
+		tokenErr = err
+		return token, err
+	})
+	if tokenErr != nil {
+		return "", 0, "", tokenErr
 	}
-	if err := as.accountRepository.RefreshSession(ctx, account, token); err != nil {
+	if err != nil {
 		return "", 0, "", sessionStoreError(err)
 	}
-	return token, account.ID, account.Username, nil
+	return current.Token, current.ID, current.Username, nil
 }
 
 func (as *AccountService) FindByID(ctx context.Context, id uint) (*Account, error) {
