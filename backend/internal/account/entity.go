@@ -1,13 +1,17 @@
 package account
 
+import "time"
+
 type Account struct {
-	ID           uint   `gorm:"primaryKey" json:"id"`
-	Username     string `gorm:"unique" json:"username"`
-	Password     string `json:"-"`
-	Token        string `json:"-"`
-	RefreshToken string `json:"-"`
-	AvatarURL    string `gorm:"type:varchar(512)" json:"avatar_url,omitempty"`
-	Bio          string `gorm:"type:varchar(255)" json:"bio,omitempty"`
+	ID               uint       `gorm:"primaryKey" json:"id"`
+	Username         string     `gorm:"unique" json:"username"`
+	Password         string     `json:"-"`
+	Token            string     `json:"-"`
+	RefreshToken     string     `gorm:"type:varchar(64);index:idx_accounts_refresh_token" json:"-"`
+	SessionID        string     `gorm:"type:varchar(64);not null;default:''" json:"-"`
+	RefreshExpiresAt *time.Time `gorm:"type:datetime(6)" json:"-"`
+	AvatarURL        string     `gorm:"type:varchar(512)" json:"avatar_url,omitempty"`
+	Bio              string     `gorm:"type:varchar(255)" json:"bio,omitempty"`
 }
 
 type CreateAccountRequest struct {
@@ -71,9 +75,9 @@ type GetProfileRequest struct {
 }
 
 type GetProfileResponse struct {
-	Account      FindByIDResponse `json:"account"`
-	VideoCount   int64            `json:"video_count"`
-	TotalLikes   int64            `json:"total_likes"`
-	FollowerCount int64           `json:"follower_count"`
-	VloggerCount int64            `json:"vlogger_count"`
+	Account       FindByIDResponse `json:"account"`
+	VideoCount    int64            `json:"video_count"`
+	TotalLikes    int64            `json:"total_likes"`
+	FollowerCount int64            `json:"follower_count"`
+	VloggerCount  int64            `json:"vlogger_count"`
 }

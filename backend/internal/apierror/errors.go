@@ -8,8 +8,9 @@ import (
 )
 
 var (
-	ErrUnauthorized = errors.New("unauthorized")
-	ErrValidation   = errors.New("validation error")
+	ErrUnauthorized       = errors.New("unauthorized")
+	ErrValidation         = errors.New("validation error")
+	ErrServiceUnavailable = errors.New("authentication temporarily unavailable")
 )
 
 func ClassifyHTTPStatus(err error) int {
@@ -18,6 +19,8 @@ func ClassifyHTTPStatus(err error) int {
 		return http.StatusOK
 	case errors.Is(err, ErrUnauthorized):
 		return http.StatusUnauthorized
+	case errors.Is(err, ErrServiceUnavailable):
+		return http.StatusServiceUnavailable
 	case errors.Is(err, ErrValidation):
 		return http.StatusBadRequest
 	case errors.Is(err, gorm.ErrRecordNotFound):

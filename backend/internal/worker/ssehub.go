@@ -1,119 +1,176 @@
 package worker
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"sync"
 	"time"
 
+	"feedsystem_video_go/internal/apierror"
 	"feedsystem_video_go/internal/auth"
+	jwtmiddleware "feedsystem_video_go/internal/middleware/jwt"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
 
 type SSEHub struct {
-	mu       sync.RWMutex
-	clients  map[uint][]chan *Notification
-	db       *gorm.DB
+	mu              sync.RWMutex
+	clients         map[uint]map[*sseClient]struct{}
+	db              *gorm.DB
+	validator       auth.TokenValidator
+	recheckInterval time.Duration
 }
 
-func NewSSEHub(db *gorm.DB) *SSEHub {
-	return &SSEHub{clients: make(map[uint][]chan *Notification), db: db}
+type sseClient struct {
+	userID        uint
+	sessionID     string
+	notifications chan *Notification
+	ctx           context.Context
+	cancel        context.CancelFunc
+}
+
+func NewSSEHub(db *gorm.DB, validator auth.TokenValidator) *SSEHub {
+	return &SSEHub{
+		clients: make(map[uint]map[*sseClient]struct{}), db: db,
+		validator: validator, recheckInterval: time.Second,
+	}
 }
 
 func (h *SSEHub) Push(userID uint, n *Notification) {
 	h.mu.RLock()
-	chs, ok := h.clients[userID]
-	h.mu.RUnlock()
-	if !ok {
-		return
-	}
-	for _, ch := range chs {
+	defer h.mu.RUnlock()
+	for client := range h.clients[userID] {
 		select {
-		case ch <- n:
+		case <-client.ctx.Done():
+		case client.notifications <- n:
 		default:
 		}
 	}
 }
 
-func (h *SSEHub) Subscribe(userID uint) chan *Notification {
-	ch := make(chan *Notification, 20)
+func (h *SSEHub) subscribe(ctx context.Context, userID uint, sessionID string) *sseClient {
+	clientCtx, cancel := context.WithCancel(ctx)
+	client := &sseClient{userID: userID, sessionID: sessionID,
+		notifications: make(chan *Notification, 20), ctx: clientCtx, cancel: cancel}
 	h.mu.Lock()
-	h.clients[userID] = append(h.clients[userID], ch)
+	if h.clients[userID] == nil {
+		h.clients[userID] = make(map[*sseClient]struct{})
+	}
+	h.clients[userID][client] = struct{}{}
 	h.mu.Unlock()
-	return ch
+	return client
 }
 
-func (h *SSEHub) Unsubscribe(userID uint, ch chan *Notification) {
+func (h *SSEHub) unsubscribe(client *sseClient) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	chs := h.clients[userID]
-	for i, c := range chs {
-		if c == ch {
-			h.clients[userID] = append(chs[:i], chs[i+1:]...)
-			close(c)
-			return
+	delete(h.clients[client.userID], client)
+	if len(h.clients[client.userID]) == 0 {
+		delete(h.clients, client.userID)
+	}
+	// Notification channels are never closed: concurrent publishers cannot send
+	// on a closed channel. Cancellation wakes the stream handler instead.
+	client.cancel()
+}
+
+func (h *SSEHub) DisconnectSession(userID uint, sessionID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for client := range h.clients[userID] {
+		if client.sessionID == sessionID {
+			client.cancel()
+			delete(h.clients[userID], client)
 		}
+	}
+	if len(h.clients[userID]) == 0 {
+		delete(h.clients, userID)
 	}
 }
 
 func (h *SSEHub) SSERequireAuth() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		token := c.Query("token")
-		if token == "" {
-			token = c.GetHeader("Authorization")
-			if len(token) > 7 && token[:7] == "Bearer " {
-				token = token[7:]
-			}
-		}
-		if token == "" {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
-			return
-		}
-		claims, err := auth.ParseToken(token)
-		if err != nil {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid token"})
-			return
-		}
-		c.Set("accountID", claims.AccountID)
-		c.Next()
-	}
+	return jwtmiddleware.QueryJWTAuth(h.validator)
 }
 
 func (h *SSEHub) SSEHandler(c *gin.Context) {
-	accountID, _ := c.Get("accountID")
-	userID := accountID.(uint)
+	userID, err := jwtmiddleware.GetAccountID(c)
+	if err != nil {
+		jwtmiddleware.AbortAuthentication(c, err)
+		return
+	}
+	token := c.GetString("accessToken")
+	client := h.subscribe(c.Request.Context(), userID, c.GetString("sessionID"))
+	defer h.unsubscribe(client)
+	// Register before rechecking, covering a logout between middleware validation
+	// and registration. A local revocation cancels this query as well.
+	claims, err := h.validator.ValidateAccessToken(client.ctx, token)
+	if err != nil {
+		if client.ctx.Err() != nil && c.Request.Context().Err() == nil {
+			err = apierror.ErrUnauthorized
+		}
+		jwtmiddleware.AbortAuthentication(c, err)
+		return
+	}
+	if claims.ExpiresAt == nil {
+		jwtmiddleware.AbortAuthentication(c, apierror.ErrUnauthorized)
+		return
+	}
+	if client.ctx.Err() != nil {
+		return
+	}
 
 	c.Writer.Header().Set("Content-Type", "text/event-stream")
 	c.Writer.Header().Set("Cache-Control", "no-cache")
 	c.Writer.Header().Set("Connection", "keep-alive")
 	c.Writer.WriteHeader(http.StatusOK)
 
-	ch := h.Subscribe(userID)
-	defer h.Unsubscribe(userID, ch)
-
-	ctx := c.Request.Context()
 	flusher, _ := c.Writer.(http.Flusher)
+	writeEvent := func(text string) bool {
+		if _, err := fmt.Fprint(c.Writer, text); err != nil {
+			return false
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+		return true
+	}
+	if !writeEvent(": connected\n\n") {
+		return
+	}
+	recheck := time.NewTicker(h.recheckInterval)
+	defer recheck.Stop()
+	heartbeat := time.NewTicker(30 * time.Second)
+	defer heartbeat.Stop()
+	expiry := time.NewTimer(time.Until(claims.ExpiresAt.Time))
+	defer expiry.Stop()
 
 	for {
 		select {
-		case <-ctx.Done():
+		case <-client.ctx.Done():
 			return
-		case n, ok := <-ch:
-			if !ok {
+		case <-expiry.C:
+			return
+		case n := <-client.notifications:
+			if _, err := h.validator.ValidateAccessToken(client.ctx, token); err != nil || client.ctx.Err() != nil {
 				return
 			}
-			b, _ := json.Marshal(n)
-			fmt.Fprintf(c.Writer, "data: %s\n\n", b)
-			if flusher != nil {
-				flusher.Flush()
+			b, err := json.Marshal(n)
+			if err != nil {
+				continue
 			}
-		case <-time.After(30 * time.Second):
-			fmt.Fprintf(c.Writer, ": keepalive\n\n")
-			if flusher != nil {
-				flusher.Flush()
+			if !writeEvent("data: " + string(b) + "\n\n") {
+				return
+			}
+		case <-recheck.C:
+			// Also detect revocations committed by another API instance.
+			if _, err := h.validator.ValidateAccessToken(client.ctx, token); err != nil {
+				return
+			}
+		case <-heartbeat.C:
+			if !writeEvent(": keepalive\n\n") {
+				return
 			}
 		}
 	}

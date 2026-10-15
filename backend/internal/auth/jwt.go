@@ -7,39 +7,61 @@ import (
 	"errors"
 	"log"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 )
 
-func jwtSecret() []byte {
-	secret := os.Getenv("JWT_SECRET")
-	if secret == "" {
-		b := make([]byte, 32)
-		if _, err := rand.Read(b); err != nil {
-			log.Printf("FATAL: cannot generate JWT secret: %v", err)
-			return []byte("fallback-unsafe-key-change-me")
-		}
-		secret = hex.EncodeToString(b)
-		log.Printf("WARNING: JWT_SECRET not set, generated random key. All tokens invalid on restart.")
+const AccessTokenTTL = 15 * time.Minute
+
+// Keep the development fallback stable for this process, including signing and
+// verification. Deployments with multiple API instances must set JWT_SECRET.
+var fallbackSecret = sync.OnceValues(func() ([]byte, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return nil, err
 	}
-	return []byte(secret)
+	log.Print("JWT_SECRET not set; using a process-local development key")
+	return b, nil
+})
+
+func jwtSecret() ([]byte, error) {
+	secret := os.Getenv("JWT_SECRET")
+	if secret != "" {
+		return []byte(secret), nil
+	}
+	return fallbackSecret()
 }
 
 type Claims struct {
 	AccountID uint   `json:"account_id"`
 	Username  string `json:"username"`
+	SessionID string `json:"sid"`
 	jwt.RegisteredClaims
 }
 
-func GenerateToken(accountID uint, username string) (string, error) {
+func GenerateToken(accountID uint, username, sessionID string) (string, error) {
+	if accountID == 0 || sessionID == "" {
+		return "", errors.New("account ID and session ID are required")
+	}
+	key, err := jwtSecret()
+	if err != nil {
+		return "", err
+	}
+	tokenID, err := GenerateSessionID()
+	if err != nil {
+		return "", err
+	}
 	now := time.Now()
 
 	claims := Claims{
 		AccountID: accountID,
 		Username:  username,
+		SessionID: sessionID,
 		RegisteredClaims: jwt.RegisteredClaims{
-			ExpiresAt: jwt.NewNumericDate(now.Add(15 * time.Minute)),
+			ID:        tokenID,
+			ExpiresAt: jwt.NewNumericDate(now.Add(AccessTokenTTL)),
 			IssuedAt:  jwt.NewNumericDate(now),
 			NotBefore: jwt.NewNumericDate(now),
 		},
@@ -47,15 +69,23 @@ func GenerateToken(accountID uint, username string) (string, error) {
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 
-	return token.SignedString(jwtSecret())
+	return token.SignedString(key)
 }
 
-func GenerateRefreshToken(accountID uint) (string, error) {
-	b := make([]byte, 32)
+func randomToken(size int) (string, error) {
+	b := make([]byte, size)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+func GenerateSessionID() (string, error) {
+	return randomToken(16)
+}
+
+func GenerateRefreshToken() (string, error) {
+	return randomToken(32)
 }
 
 func ParseToken(tokenString string) (*Claims, error) {
@@ -66,15 +96,17 @@ func ParseToken(tokenString string) (*Claims, error) {
 			if token.Method == nil || token.Method.Alg() != jwt.SigningMethodHS256.Alg() {
 				return nil, errors.New("unexpected signing method")
 			}
-			return jwtSecret(), nil
+			return jwtSecret()
 		},
+		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
+		jwt.WithExpirationRequired(),
 	)
 	if err != nil {
 		return nil, err
 	}
 
 	claims, ok := token.Claims.(*Claims)
-	if !ok || !token.Valid {
+	if !ok || !token.Valid || claims.AccountID == 0 || claims.SessionID == "" || claims.ID == "" {
 		return nil, jwt.ErrTokenInvalidClaims
 	}
 

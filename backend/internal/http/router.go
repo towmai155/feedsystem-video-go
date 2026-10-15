@@ -6,16 +6,16 @@ import (
 	"feedsystem_video_go/internal/feed"
 	"feedsystem_video_go/internal/message"
 	"feedsystem_video_go/internal/middleware/jwt"
-	"feedsystem_video_go/internal/middleware/ratelimit"
 	"feedsystem_video_go/internal/middleware/rabbitmq"
+	"feedsystem_video_go/internal/middleware/ratelimit"
 	rediscache "feedsystem_video_go/internal/middleware/redis"
 	"feedsystem_video_go/internal/social"
 	"feedsystem_video_go/internal/video"
 	"feedsystem_video_go/internal/worker"
-	"log"
-	"time"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
+	"log"
+	"time"
 )
 
 func SetRouter(db *gorm.DB, cache *rediscache.Client, rmq *rabbitmq.RabbitMQ) *gin.Engine {
@@ -34,7 +34,9 @@ func SetRouter(db *gorm.DB, cache *rediscache.Client, rmq *rabbitmq.RabbitMQ) *g
 
 	// account
 	accountRepository := account.NewAccountRepository(db)
-	accountService := account.NewAccountService(accountRepository, cache)
+	sessionValidator := account.NewSessionValidator(accountRepository)
+	sseHub := worker.NewSSEHub(db, sessionValidator)
+	accountService := account.NewAccountService(accountRepository, sseHub.DisconnectSession)
 	accountHandler := account.NewAccountHandler(accountService)
 	accountGroup := r.Group("/account")
 	{
@@ -46,7 +48,7 @@ func SetRouter(db *gorm.DB, cache *rediscache.Client, rmq *rabbitmq.RabbitMQ) *g
 		accountGroup.POST("/refresh", accountHandler.Refresh)
 	}
 	protectedAccountGroup := accountGroup.Group("")
-	protectedAccountGroup.Use(jwt.JWTAuth(accountRepository, cache))
+	protectedAccountGroup.Use(jwt.JWTAuth(sessionValidator))
 	{
 		protectedAccountGroup.POST("/logout", accountHandler.Logout)
 		protectedAccountGroup.POST("/rename", accountHandler.Rename)
@@ -68,7 +70,7 @@ func SetRouter(db *gorm.DB, cache *rediscache.Client, rmq *rabbitmq.RabbitMQ) *g
 		videoGroup.POST("/getDetail", videoHandler.GetDetail)
 	}
 	protectedVideoGroup := videoGroup.Group("")
-	protectedVideoGroup.Use(jwt.JWTAuth(accountRepository, cache))
+	protectedVideoGroup.Use(jwt.JWTAuth(sessionValidator))
 	{
 		protectedVideoGroup.POST("/uploadVideo", videoHandler.UploadVideo)
 		protectedVideoGroup.POST("/uploadCover", videoHandler.UploadCover)
@@ -86,7 +88,7 @@ func SetRouter(db *gorm.DB, cache *rediscache.Client, rmq *rabbitmq.RabbitMQ) *g
 	likeHandler := video.NewLikeHandler(likeService)
 	likeGroup := r.Group("/like")
 	protectedLikeGroup := likeGroup.Group("")
-	protectedLikeGroup.Use(jwt.JWTAuth(accountRepository, cache))
+	protectedLikeGroup.Use(jwt.JWTAuth(sessionValidator))
 	{
 		protectedLikeGroup.POST("/like", likeLimiter, likeHandler.Like)
 		protectedLikeGroup.POST("/unlike", likeLimiter, likeHandler.Unlike)
@@ -107,7 +109,7 @@ func SetRouter(db *gorm.DB, cache *rediscache.Client, rmq *rabbitmq.RabbitMQ) *g
 		commentGroup.POST("/listAll", commentHandler.GetAllComments)
 	}
 	protectedCommentGroup := commentGroup.Group("")
-	protectedCommentGroup.Use(jwt.JWTAuth(accountRepository, cache))
+	protectedCommentGroup.Use(jwt.JWTAuth(sessionValidator))
 	{
 		protectedCommentGroup.POST("/publish", commentLimiter, commentHandler.PublishComment)
 		protectedCommentGroup.POST("/delete", commentLimiter, commentHandler.DeleteComment)
@@ -123,7 +125,7 @@ func SetRouter(db *gorm.DB, cache *rediscache.Client, rmq *rabbitmq.RabbitMQ) *g
 	socialHandler := social.NewSocialHandler(socialService)
 	socialGroup := r.Group("/social")
 	protectedSocialGroup := socialGroup.Group("")
-	protectedSocialGroup.Use(jwt.JWTAuth(accountRepository, cache))
+	protectedSocialGroup.Use(jwt.JWTAuth(sessionValidator))
 	{
 		protectedSocialGroup.POST("/follow", socialLimiter, socialHandler.Follow)
 		protectedSocialGroup.POST("/unfollow", socialLimiter, socialHandler.Unfollow)
@@ -153,7 +155,7 @@ func SetRouter(db *gorm.DB, cache *rediscache.Client, rmq *rabbitmq.RabbitMQ) *g
 		vloggerCount, _ := socialRepository.CountVloggers(c.Request.Context(), req.AccountID)
 
 		c.JSON(200, account.GetProfileResponse{
-			Account: account.FindByIDResponse{ID: acc.ID, Username: acc.Username, AvatarURL: acc.AvatarURL, Bio: acc.Bio},
+			Account:    account.FindByIDResponse{ID: acc.ID, Username: acc.Username, AvatarURL: acc.AvatarURL, Bio: acc.Bio},
 			VideoCount: videoCount, TotalLikes: totalLikes,
 			FollowerCount: followerCount, VloggerCount: vloggerCount,
 		})
@@ -163,7 +165,7 @@ func SetRouter(db *gorm.DB, cache *rediscache.Client, rmq *rabbitmq.RabbitMQ) *g
 	feedService := feed.NewFeedService(feedRepository, likeRepository, cache)
 	feedHandler := feed.NewFeedHandler(feedService)
 	feedGroup := r.Group("/feed")
-	feedGroup.Use(jwt.SoftJWTAuth(accountRepository, cache))
+	feedGroup.Use(jwt.SoftJWTAuth(sessionValidator))
 	{
 		feedGroup.POST("/listLatest", feedHandler.ListLatest)
 		feedGroup.POST("/listLikesCount", feedHandler.ListLikesCount)
@@ -171,7 +173,7 @@ func SetRouter(db *gorm.DB, cache *rediscache.Client, rmq *rabbitmq.RabbitMQ) *g
 		feedGroup.POST("/listByTag", feedHandler.ListByTag)
 	}
 	protectedFeedGroup := feedGroup.Group("")
-	protectedFeedGroup.Use(jwt.JWTAuth(accountRepository, cache))
+	protectedFeedGroup.Use(jwt.JWTAuth(sessionValidator))
 	{
 		protectedFeedGroup.POST("/listByFollowing", feedHandler.ListByFollowing)
 	}
@@ -181,7 +183,7 @@ func SetRouter(db *gorm.DB, cache *rediscache.Client, rmq *rabbitmq.RabbitMQ) *g
 	messageHandler := message.NewHandler(messageService)
 	messageGroup := r.Group("/message")
 	protectedMessageGroup := messageGroup.Group("")
-	protectedMessageGroup.Use(jwt.JWTAuth(accountRepository, cache))
+	protectedMessageGroup.Use(jwt.JWTAuth(sessionValidator))
 	{
 		protectedMessageGroup.POST("/send", messageHandler.Send)
 		protectedMessageGroup.POST("/list", messageHandler.List)
@@ -201,7 +203,6 @@ func SetRouter(db *gorm.DB, cache *rediscache.Client, rmq *rabbitmq.RabbitMQ) *g
 		rmq.DeclareTopic("comment.events", "notification.comment", "comment.publish")
 		rmq.DeclareTopic("social.events", "notification.social", "social.follow")
 	}
-	sseHub := worker.NewSSEHub(db)
 	notifGroup := r.Group("/notification")
 	notifGroup.Use(sseHub.SSERequireAuth())
 	sseHub.RegisterRoutes(r, notifGroup)

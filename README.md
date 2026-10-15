@@ -50,6 +50,36 @@ cd frontend
 npm install && npm run dev
 ```
 
+## 登录态与升级
+
+登录态以 MySQL 为唯一依据。每次登录生成新的 `session_id`；Access Token 包含 `sid` 和唯一 `jti`，有效期 15 分钟。业务接口和通知接口校验 JWT 后，再按用户主键检查数据库中的会话与当前 Token，不读取或回填 Redis 登录态。
+
+刷新时通过索引查询 Refresh Token，并在数据库中校验 7 天过期时间；条件更新同时匹配用户、会话和 Refresh Token，避免登出或重新登录后被旧请求覆盖。改密与撤销会话在同一个事务内完成，旧登出请求只影响其所属会话。
+
+数据库暂时不可用时，鉴权和刷新返回 `503`，前端保留凭证供重试；无效、过期或撤销的凭证返回 `401`。SSE 使用同一鉴权规则，本进程登出或重新登录会主动关闭旧会话连接；其他进程的撤销由每秒复查发现，每次发送通知前也会复查，并在 Access Token 到期时关闭连接。
+
+启动时 AutoMigrate 会增加 `session_id`、`refresh_expires_at` 和 Refresh Token 查询索引。升级前的凭证缺少会话信息，用户需要重新登录一次。多 API 实例必须配置相同的 `JWT_SECRET`。
+
+## 验证
+
+前端测试需要 Node.js 22.12 或更高的受支持版本；Docker 构建使用 Node.js 24。
+
+```bash
+cd backend
+go test ./...
+
+# MySQL 集成测试使用独立随机测试库，账号需有创建和删除测试库的权限。
+# 未提供连接串时，集成测试会跳过，普通单元测试仍会运行。
+FEEDSYSTEM_TEST_MYSQL_DSN='user:password@tcp(127.0.0.1:3306)/?parseTime=true' go test ./... -count=1
+
+cd ../frontend
+npm ci
+npm test
+npm run build
+```
+
+竞态检测使用 `go test -race ./...`。Windows + MinGW 若遇到运行库加载问题，可使用 `go test -race -ldflags='-linkmode=external -extldflags=-static' ./...`；MySQL 集成测试仍需设置上述连接串。
+
 ## 接口清单
 
 ### 账号 `/account`

@@ -14,117 +14,97 @@ export class ApiError extends Error {
 }
 
 type ApiErrorBody = { error?: string }
+type AuthSnapshot = { token: string | null; refreshToken: string | null }
+type RequestOptions = { authRequired?: boolean }
 
 const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? '/api'
+const credentialEndpoints = new Set(['/account/login', '/account/register', '/account/changePassword'])
+const refreshRequests = new Map<string, Promise<string | null>>()
 
-let isRefreshing = false
-let refreshPromise: Promise<string | null> | null = null
-
-async function tryRefresh(): Promise<string | null> {
+function snapshotAuth(): AuthSnapshot {
   const auth = useAuthStore()
-  if (!auth.refreshToken) return null
-  if (isRefreshing) return refreshPromise
-  isRefreshing = true
-  refreshPromise = (async () => {
-    try {
-      const res = await fetch(`${API_BASE}/account/refresh`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ refresh_token: auth.refreshToken }),
-      })
-      if (!res.ok) { auth.clearTokens(); return null }
-      const data = await res.json()
-      auth.setToken(data.token)
-      return data.token as string
-    } catch {
-      auth.clearTokens()
-      return null
-    } finally {
-      isRefreshing = false
-    }
-  })()
-  return refreshPromise
+  return { token: auth.token, refreshToken: auth.refreshToken }
 }
 
-export async function postJson<T>(path: string, body: unknown, options?: { authRequired?: boolean }): Promise<T> {
+function isCurrent(snapshot: AuthSnapshot): boolean {
   const auth = useAuthStore()
-  const token = auth.token
+  return auth.token === snapshot.token && auth.refreshToken === snapshot.refreshToken
+}
 
-  if (options?.authRequired && !token) {
+function tryRefresh(): Promise<string | null> {
+  const snapshot = snapshotAuth()
+  const refreshToken = snapshot.refreshToken
+  if (!refreshToken) return Promise.resolve(null)
+  const pending = refreshRequests.get(refreshToken)
+  if (pending) return pending
+
+  const request = Promise.resolve().then(async () => {
+    const res = await fetch(`${API_BASE}/account/refresh`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refresh_token: refreshToken }),
+    })
+    const data = await handleResponse<{ token: string }>(res, '/account/refresh', snapshot)
+    // A response from a previous session must not restore a logged-out user or
+    // overwrite credentials established by a newer login/rename.
+    if (!isCurrent(snapshot)) return null
+    useAuthStore().setToken(data.token)
+    return data.token
+  }).finally(() => {
+    if (refreshRequests.get(refreshToken) === request) refreshRequests.delete(refreshToken)
+  })
+  refreshRequests.set(refreshToken, request)
+  return request
+}
+
+async function send<T>(path: string, body: BodyInit, headers: Record<string, string>, options?: RequestOptions): Promise<T> {
+  const snapshot = snapshotAuth()
+  if (options?.authRequired && !snapshot.token) {
     throw new ApiError('需要先登录（缺少 token）', 401)
   }
+  if (snapshot.token && !credentialEndpoints.has(path) && path !== '/account/refresh') {
+    headers.Authorization = `Bearer ${snapshot.token}`
+  }
+  const res = await fetch(`${API_BASE}${path}`, { method: 'POST', headers, body })
 
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-  if (token) headers.Authorization = `Bearer ${token}`
-
-  const res = await fetch(`${API_BASE}${path}`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(body ?? {}),
-  })
-
-  if (res.status === 401 && path !== '/account/refresh') {
-    const newToken = await tryRefresh()
-    if (newToken) {
+  if (res.status === 401 && path !== '/account/refresh' && !credentialEndpoints.has(path) &&
+      snapshot.refreshToken && useAuthStore().refreshToken === snapshot.refreshToken) {
+    const auth = useAuthStore()
+    const newToken = auth.token !== snapshot.token ? auth.token : await tryRefresh()
+    if (newToken && useAuthStore().refreshToken === snapshot.refreshToken) {
+      const retrySnapshot = snapshotAuth()
       headers.Authorization = `Bearer ${newToken}`
-      const retryRes = await fetch(`${API_BASE}${path}`, {
-        method: 'POST', headers, body: JSON.stringify(body ?? {}),
-      })
-      return handleResponse<T>(retryRes, path)
+      const retryRes = await fetch(`${API_BASE}${path}`, { method: 'POST', headers, body })
+      return handleResponse<T>(retryRes, path, retrySnapshot)
     }
   }
-
-  return handleResponse<T>(res, path)
+  return handleResponse<T>(res, path, snapshot)
 }
 
-export async function postForm<T>(path: string, body: FormData, options?: { authRequired?: boolean }): Promise<T> {
-  const auth = useAuthStore()
-  const token = auth.token
-
-  if (options?.authRequired && !token) {
-    throw new ApiError('需要先登录（缺少 token）', 401)
-  }
-
-  const headers: Record<string, string> = {}
-  if (token) headers.Authorization = `Bearer ${token}`
-
-  const res = await fetch(`${API_BASE}${path}`, {
-    method: 'POST',
-    headers,
-    body,
-  })
-
-  if (res.status === 401 && path !== '/account/refresh') {
-    const newToken = await tryRefresh()
-    if (newToken) {
-      headers.Authorization = `Bearer ${newToken}`
-      const retryRes = await fetch(`${API_BASE}${path}`, {
-        method: 'POST', headers, body,
-      })
-      return handleResponse<T>(retryRes, path)
-    }
-  }
-
-  return handleResponse<T>(res, path)
+export function postJson<T>(path: string, body: unknown, options?: RequestOptions): Promise<T> {
+  return send<T>(path, JSON.stringify(body ?? {}), { 'Content-Type': 'application/json' }, options)
 }
 
-async function handleResponse<T>(res: Response, path: string): Promise<T> {
-  const auth = useAuthStore()
+export function postForm<T>(path: string, body: FormData, options?: RequestOptions): Promise<T> {
+  return send<T>(path, body, {}, options)
+}
+
+async function handleResponse<T>(res: Response, path: string, snapshot: AuthSnapshot): Promise<T> {
   const text = await res.text()
   let data: unknown = null
   if (text) {
     try { data = JSON.parse(text) } catch { data = text }
   }
-
   if (!res.ok) {
-    if (res.status === 401) auth.clearTokens()
+    if (res.status === 401 && !credentialEndpoints.has(path) && isCurrent(snapshot)) {
+      useAuthStore().clearTokens()
+    }
     const msg = data && typeof data === 'object' && (data as ApiErrorBody).error
       ? String((data as ApiErrorBody).error)
       : `请求失败 (${res.status})`
-    const apiErr = new ApiError(msg, res.status, data)
-    reportError(apiErr, { path, status: res.status })
-    throw apiErr
+    const error = new ApiError(msg, res.status, data)
+    reportError(error, { path, status: res.status })
+    throw error
   }
-
   return data as T
 }

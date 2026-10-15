@@ -42,8 +42,10 @@ async function submitRename() {
   }
 
   busy.value = true
+  const renameRefreshToken = auth.refreshToken
   try {
     const res = await accountApi.rename(newUsername)
+    if (auth.refreshToken !== renameRefreshToken) return
     auth.setToken(res.token)
     rename.open = false
     toast.success('改名成功（已刷新 token）')
@@ -69,17 +71,19 @@ async function onLogout() {
   if (!window.confirm('确认退出登录？')) return
 
   busy.value = true
+  const logoutRefreshToken = auth.refreshToken
   try {
     await accountApi.logout()
+    if (auth.refreshToken !== logoutRefreshToken) return
+    auth.clearTokens()
+    rename.open = false
+    toast.info('已退出登录')
+    await router.push('/')
   } catch (e) {
     const msg = e instanceof ApiError ? e.message : String(e)
     toast.error(`登出失败：${msg}`)
   } finally {
-    auth.clearTokens()
-    rename.open = false
-    toast.info('已退出登录')
     busy.value = false
-    await router.push('/')
   }
 }
 </script>
