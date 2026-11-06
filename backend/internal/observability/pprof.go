@@ -2,6 +2,8 @@ package observability
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -17,18 +19,25 @@ type PprofServer struct {
 	shutdownTimeout time.Duration
 }
 
-func NewPprofMux() *http.ServeMux {
+func NewPprofMux(databases ...*sql.DB) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/debug/pprof/", pprof.Index)
 	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
 	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
 	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
 	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	if len(databases) > 0 && databases[0] != nil {
+		pool := databases[0]
+		mux.HandleFunc("GET /debug/dbstats", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(pool.Stats())
+		})
+	}
 
 	return mux
 }
 
-func NewPprofServer(name string, enabled bool, addr string) (*PprofServer, error) {
+func NewPprofServer(name string, enabled bool, addr string, databases ...*sql.DB) (*PprofServer, error) {
 	if !enabled || addr == "" {
 		return nil, nil
 	}
@@ -42,7 +51,7 @@ func NewPprofServer(name string, enabled bool, addr string) (*PprofServer, error
 	}
 	pprofServer.server = &http.Server{
 		Addr:              addr,
-		Handler:           NewPprofMux(),
+		Handler:           NewPprofMux(databases...),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	go func() {

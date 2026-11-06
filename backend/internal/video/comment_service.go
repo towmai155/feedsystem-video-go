@@ -3,11 +3,13 @@ package video
 import (
 	"context"
 	"errors"
+	"feedsystem_video_go/internal/apierror"
+	"feedsystem_video_go/internal/events"
 	"feedsystem_video_go/internal/middleware/rabbitmq"
 	rediscache "feedsystem_video_go/internal/middleware/redis"
-	"feedsystem_video_go/internal/apierror"
 	"regexp"
 	"strings"
+	"time"
 
 	"gorm.io/gorm"
 )
@@ -36,56 +38,39 @@ func (s *CommentService) Publish(ctx context.Context, comment *Comment) error {
 	if comment.Content == "" {
 		return errors.New("content is required")
 	}
-
-	exists, err := s.VideoRepository.IsExist(ctx, comment.VideoID)
+	release, err := interactionWrites.acquire(ctx, comment.VideoID)
 	if err != nil {
 		return err
 	}
-	if !exists {
-		return errors.New("video not found")
-	}
+	defer release()
 
-	mysqlEnqueued := false
-	redisEnqueued := false
-	if s.commentMQ != nil {
-		if err := s.commentMQ.Publish(ctx, comment.Username, comment.VideoID, comment.AuthorID, comment.Content); err == nil {
-			mysqlEnqueued = true
-		}
-	}
-	if s.popularityMQ != nil {
-		if err := s.popularityMQ.Update(ctx, comment.VideoID, 1); err == nil {
-			redisEnqueued = true
-		}
-	}
-	if mysqlEnqueued && redisEnqueued {
-		s.notifyMentions(ctx, comment)
-		return nil
-	}
-
-	// Fallback: direct MySQL write when comment MQ publish fails.
-	if !mysqlEnqueued {
-		if err := s.repo.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			if err := tx.Select("id").First(&Video{}, comment.VideoID).Error; err != nil {
-				if errors.Is(err, gorm.ErrRecordNotFound) {
-					return errors.New("video not found")
-				}
-				return err
+	// 评论、热度事件、@mention 通知在同一个事务里落库，提交后由 outbox
+	// dispatcher 负责投递。HTTP 返回时评论一定可见，且不会出现"评论成功但
+	// 事件/通知丢失"的部分提交。
+	err = s.repo.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Select("id").First(&Video{}, comment.VideoID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errors.New("video not found")
 			}
-			if err := tx.Create(comment).Error; err != nil {
-				return err
-			}
-			return tx.Model(&Video{}).Where("id = ?", comment.VideoID).
-				UpdateColumn("popularity", gorm.Expr("popularity + 1")).Error
-		}); err != nil {
 			return err
 		}
+		if err := tx.Create(comment).Error; err != nil {
+			return err
+		}
+		if err := enqueueComment(tx, comment); err != nil {
+			return err
+		}
+		// @mention 通知和评论同事务：提交成功的评论不会丢 mention，
+		// 插入失败则整体回滚，避免出现"评论已可见但通知永远没发"。
+		if err := enqueueMentions(tx, comment); err != nil {
+			return err
+		}
+		return tx.Model(&Video{}).Where("id = ?", comment.VideoID).
+			UpdateColumn("popularity", gorm.Expr("popularity + 1")).Error
+	})
+	if err != nil {
+		return err
 	}
-
-	// Fallback: direct Redis update when popularity MQ publish fails.
-	if !redisEnqueued {
-		UpdatePopularityCache(ctx, s.cache, comment.VideoID, 1)
-	}
-	s.notifyMentions(ctx, comment)
 	return nil
 }
 
@@ -121,12 +106,25 @@ func (s *CommentService) GetAll(ctx context.Context, videoID uint) ([]Comment, e
 
 var mentionRegex = regexp.MustCompile(`@(\w+)`)
 
-func (s *CommentService) notifyMentions(ctx context.Context, comment *Comment) {
+// mentionNotification 用显式 EventID 写入 notifications 表，和 MQ 消费者共用
+// idx_notification_event 唯一索引：同一条 mention 被重复处理时不会重复插入。
+type mentionNotification struct {
+	RecipientID uint
+	SenderID    uint
+	Type        string
+	TargetID    uint
+	Content     string
+	EventID     *string
+	CreatedAt   time.Time
+}
+
+func enqueueMentions(tx *gorm.DB, comment *Comment) error {
 	matches := mentionRegex.FindAllStringSubmatch(comment.Content, -1)
 	if len(matches) == 0 {
-		return
+		return nil
 	}
 	seen := make(map[string]bool)
+	notifications := make([]mentionNotification, 0, len(matches))
 	for _, m := range matches {
 		username := m[1]
 		if seen[username] || username == comment.Username {
@@ -134,22 +132,28 @@ func (s *CommentService) notifyMentions(ctx context.Context, comment *Comment) {
 		}
 		seen[username] = true
 		var accID uint
-		if err := s.repo.db.WithContext(ctx).Table("accounts").Where("username = ?", username).Select("id").Scan(&accID).Error; err != nil || accID == 0 {
+		if err := tx.Table("accounts").Where("username = ?", username).Select("id").Scan(&accID).Error; err != nil {
+			return err
+		}
+		if accID == 0 {
 			continue
 		}
-		notif := struct {
-			RecipientID uint
-			SenderID    uint
-			Type        string
-			TargetID    uint
-			Content     string
-		}{
+		eventID, err := events.NewID()
+		if err != nil {
+			return err
+		}
+		notifications = append(notifications, mentionNotification{
 			RecipientID: accID,
 			SenderID:    comment.AuthorID,
 			Type:        "mention",
 			TargetID:    comment.VideoID,
 			Content:     comment.Username + " 在评论中提到了你",
-		}
-		s.repo.db.WithContext(ctx).Table("notifications").Create(&notif)
+			EventID:     &eventID,
+			CreatedAt:   time.Now(),
+		})
 	}
+	if len(notifications) == 0 {
+		return nil
+	}
+	return tx.Table("notifications").Create(&notifications).Error
 }

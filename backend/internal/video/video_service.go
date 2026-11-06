@@ -135,19 +135,17 @@ func (vs *VideoService) GetDetail(ctx context.Context, id uint) (*Video, error) 
 	}
 
 	if vs.cache != nil {
-		if v, ok := getCached(); ok {
-			return v, nil
-		}
-
+		// 只读一次缓存：以前这里先 getCached() 再 GetBytes() 一次，同一份数据查两遍。
 		opCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
 		b, err := vs.cache.GetBytes(opCtx, cacheKey)
 		cancel()
 		if err == nil {
 			var cached Video
-			if err := json.Unmarshal(b, &cached); err == nil {
+			if jsonErr := json.Unmarshal(b, &cached); jsonErr == nil {
 				return &cached, nil
 			}
-		} else if rediscache.IsMiss(err) {
+		}
+		if rediscache.IsMiss(err) {
 			lockKey := "lock:" + cacheKey
 
 			lockCtx, lockCancel := context.WithTimeout(ctx, 50*time.Millisecond)

@@ -28,6 +28,8 @@ type CommentEvent struct {
 	AuthorID   uint      `json:"author_id,omitempty"`
 	Content    string    `json:"content,omitempty"`
 	OccurredAt time.Time `json:"occurred_at"`
+	// Applied 表示评论已经在 HTTP 请求里同步写入 MySQL，消费者只需生成通知。
+	Applied bool `json:"applied,omitempty"`
 }
 
 func NewCommentMQ(base *RabbitMQ) (*CommentMQ, error) {
@@ -46,6 +48,7 @@ func (c *CommentMQ) Publish(ctx context.Context, username string, videoID, autho
 		VideoID:  videoID,
 		AuthorID: authorID,
 		Content:  content,
+		Applied:  true,
 	})
 }
 
@@ -68,4 +71,3 @@ func (c *CommentMQ) publish(ctx context.Context, action, routingKey string, evt 
 	evt.OccurredAt = time.Now().UTC()
 	return c.PublishJSON(ctx, commentExchange, routingKey, evt)
 }
-

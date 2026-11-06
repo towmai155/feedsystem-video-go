@@ -1,8 +1,10 @@
 package video
 
 import (
-	"feedsystem_video_go/internal/middleware/jwt"
+	"errors"
+
 	"feedsystem_video_go/internal/apierror"
+	"feedsystem_video_go/internal/middleware/jwt"
 
 	"github.com/gin-gonic/gin"
 )
@@ -37,7 +39,12 @@ func (lh *LikeHandler) Like(c *gin.Context) {
 		AccountID: accountID,
 	}
 	if err := lh.service.Like(c.Request.Context(), like); err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
+		// 幂等：并发或重复点赞返回 200，只有真正的失败才是 5xx。
+		if errors.Is(err, ErrAlreadyLiked) {
+			c.JSON(200, gin.H{"message": "like success", "already_liked": true})
+			return
+		}
+		c.JSON(apierror.ClassifyHTTPStatus(err), gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(200, gin.H{"message": "like success"})
@@ -65,7 +72,12 @@ func (lh *LikeHandler) Unlike(c *gin.Context) {
 		AccountID: accountID,
 	}
 	if err := lh.service.Unlike(c.Request.Context(), like); err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
+		// 幂等：没有点过赞时取消也返回 200。
+		if errors.Is(err, ErrNotLiked) {
+			c.JSON(200, gin.H{"message": "unlike success", "already_unliked": true})
+			return
+		}
+		c.JSON(apierror.ClassifyHTTPStatus(err), gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(200, gin.H{"message": "unlike success"})

@@ -66,8 +66,18 @@ func (vr *VideoRepository) UpdateLikesCount(ctx context.Context, id uint, likesC
 }
 
 func (vr *VideoRepository) IsExist(ctx context.Context, id uint) (bool, error) {
+	return vr.IsExistTx(vr.db.WithContext(ctx), id)
+}
+
+// Transaction runs fn on one connection so an interaction can insert its row and
+// update the counters atomically instead of leaving a half-applied event behind.
+func (vr *VideoRepository) Transaction(ctx context.Context, fn func(tx *gorm.DB) error) error {
+	return vr.db.WithContext(ctx).Transaction(fn)
+}
+
+func (vr *VideoRepository) IsExistTx(tx *gorm.DB, id uint) (bool, error) {
 	var video Video
-	if err := vr.db.WithContext(ctx).First(&video, id).Error; err != nil {
+	if err := tx.First(&video, id).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return false, nil
 		}
@@ -86,21 +96,23 @@ func (vr *VideoRepository) UpdatePopularity(ctx context.Context, id uint, change
 }
 
 func (vr *VideoRepository) ChangeLikesCount(ctx context.Context, id uint, change int64) error {
-	if err := vr.db.WithContext(ctx).Model(&Video{}).
+	return vr.ChangeLikesCountTx(vr.db.WithContext(ctx), id, change)
+}
+
+func (vr *VideoRepository) ChangeLikesCountTx(tx *gorm.DB, id uint, change int64) error {
+	return tx.Model(&Video{}).
 		Where("id = ?", id).
-		UpdateColumn("likes_count", gorm.Expr("GREATEST(likes_count + ?, 0)", change)).Error; err != nil {
-		return err
-	}
-	return nil
+		UpdateColumn("likes_count", gorm.Expr("GREATEST(likes_count + ?, 0)", change)).Error
 }
 
 func (vr *VideoRepository) ChangePopularity(ctx context.Context, id uint, change int64) error {
-	if err := vr.db.WithContext(ctx).Model(&Video{}).
+	return vr.ChangePopularityTx(vr.db.WithContext(ctx), id, change)
+}
+
+func (vr *VideoRepository) ChangePopularityTx(tx *gorm.DB, id uint, change int64) error {
+	return tx.Model(&Video{}).
 		Where("id = ?", id).
-		UpdateColumn("popularity", gorm.Expr("GREATEST(popularity + ?, 0)", change)).Error; err != nil {
-		return err
-	}
-	return nil
+		UpdateColumn("popularity", gorm.Expr("GREATEST(popularity + ?, 0)", change)).Error
 }
 
 func (vr *VideoRepository) CountByAuthor(ctx context.Context, authorID uint) (int64, error) {

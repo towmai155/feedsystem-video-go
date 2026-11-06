@@ -1,0 +1,23 @@
+server:
+  port: 18088
+database:
+  host: 127.0.0.1
+  port: 13307
+  user: root
+  password: p0-local-only
+  dbname: p0_loadtest
+redis:
+  host: 127.0.0.1
+  port: 16379
+  password: ""
+  db: 0
+rabbitmq:
+  host: 127.0.0.1
+  port: 15673
+  username: p0
+  password: p0-local-only
+observability:
+  pprof:
+    enabled: true
+    api_addr: 127.0.0.1:16060
+    worker_addr: 127.0.0.1:16061

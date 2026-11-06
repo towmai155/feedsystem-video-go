@@ -20,10 +20,12 @@ export function useLikeFollow(needLogin: () => void) {
     if (likeBusy[key]) return
     likeBusy[key] = true
     try {
-      if (item.is_liked) await likeApi.unlike(item.id)
-      else await likeApi.like(item.id)
-      item.is_liked = !item.is_liked
-      item.likes_count = Math.max(0, item.likes_count + (item.is_liked ? 1 : -1))
+      const wasLiked = item.is_liked
+      const res = wasLiked ? await likeApi.unlike(item.id) : await likeApi.like(item.id)
+      // 服务端幂等命中时（例如另一个标签页已经点过），状态要纠正，但计数不能再动一次。
+      const already = wasLiked ? res?.already_unliked : res?.already_liked
+      item.is_liked = !wasLiked
+      if (!already) item.likes_count = Math.max(0, item.likes_count + (item.is_liked ? 1 : -1))
     } catch (e) {
       const msg = e instanceof ApiError ? e.message : String(e)
       toast.error(msg)

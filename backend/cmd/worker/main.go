@@ -4,39 +4,18 @@ import (
 	"context"
 	"feedsystem_video_go/internal/config"
 	"feedsystem_video_go/internal/db"
+	"feedsystem_video_go/internal/events"
+	"feedsystem_video_go/internal/middleware/rabbitmq"
 	rediscache "feedsystem_video_go/internal/middleware/redis"
 	"feedsystem_video_go/internal/observability"
-	"feedsystem_video_go/internal/social"
-	"feedsystem_video_go/internal/video"
 	"feedsystem_video_go/internal/worker"
-	mqrabbit "feedsystem_video_go/internal/middleware/rabbitmq"
 	"log"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 	"time"
 
-	amqp "github.com/rabbitmq/amqp091-go"
 	"gorm.io/gorm"
-)
-
-const (
-	socialExchange   = "social.events"
-	socialQueue      = "social.events"
-	socialBindingKey = "social.*"
-
-	likeExchange   = "like.events"
-	likeQueue      = "like.events"
-	likeBindingKey = "like.*"
-
-	commentExchange   = "comment.events"
-	commentQueue      = "comment.events"
-	commentBindingKey = "comment.*"
-
-	popularityExchange   = "video.popularity.events"
-	popularityQueue      = "video.popularity.events"
-	popularityBindingKey = "video.popularity.*"
 )
 
 func connectWithRetry(name string, maxRetries int, fn func() error) {
@@ -44,33 +23,22 @@ func connectWithRetry(name string, maxRetries int, fn func() error) {
 		if err := fn(); err == nil {
 			return
 		}
-		wait := time.Duration(1<<i) * time.Second
-		if wait > 30*time.Second {
-			wait = 30 * time.Second
-		}
-		log.Printf("%s 不可用，%v 后重试 (%d/%d)...", name, wait, i+1, maxRetries)
+		wait := min(time.Duration(1<<i)*time.Second, 30*time.Second)
+		log.Printf("%s unavailable; retrying in %v (%d/%d)", name, wait, i+1, maxRetries)
 		time.Sleep(wait)
 	}
-	log.Fatalf("%s: 超过最大重试次数", name)
+	log.Fatalf("%s: maximum startup retries exceeded", name)
 }
 
 func main() {
-	// 加载配置
 	configPath := os.Getenv("CONFIG_PATH")
 	if configPath == "" {
 		configPath = "configs/config.yaml"
 	}
-	log.Printf("Loading config from %s", configPath)
-	cfg, usedDefault, err := config.LoadLocalDev(configPath)
+	cfg, _, err := config.LoadLocalDev(configPath)
 	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
+		log.Fatalf("load config: %v", err)
 	}
-	if usedDefault {
-		log.Printf("Config File %s not found, using default local config", configPath)
-	} else {
-		log.Printf("Config loaded from file: %s", configPath)
-	}
-	// 连接数据库（带重试）
 	var sqlDB *gorm.DB
 	connectWithRetry("MySQL", 10, func() error {
 		var err error
@@ -78,239 +46,37 @@ func main() {
 		return err
 	})
 	defer db.CloseDB(sqlDB)
-
-	// 连接 Redis（用于流行度更新）
+	// Both entry points initialize new reliability tables, so startup order is
+	// irrelevant and a standalone worker can recover after an API outage.
+	if err := db.AutoMigrate(sqlDB); err != nil {
+		log.Fatalf("migrate worker schema: %v", err)
+	}
 	cache, err := rediscache.NewFromEnv(&cfg.Redis)
 	if err != nil {
-		log.Printf("Redis config error (popularity worker disabled): %v", err)
-		cache = nil
-	} else {
-		pingCtx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
-		defer cancel()
-		if err := cache.Ping(pingCtx); err != nil {
-			log.Printf("Redis not available (popularity worker disabled): %v", err)
-			_ = cache.Close()
-			cache = nil
-		} else {
-			defer cache.Close()
-			log.Printf("Redis connected (popularity worker enabled)")
-		}
+		log.Fatalf("Redis config: %v", err)
 	}
-	// 连接 RabbitMQ（带重试）
-	url := "amqp://" + cfg.RabbitMQ.Username + ":" + cfg.RabbitMQ.Password + "@" + cfg.RabbitMQ.Host + ":" + strconv.Itoa(cfg.RabbitMQ.Port) + "/"
-	var conn *amqp.Connection
-	connectWithRetry("RabbitMQ", 10, func() error {
-		var err error
-		conn, err = amqp.Dial(url)
-		return err
-	})
-	defer conn.Close()
-	// 创建 RabbitMQ 通道
-	ch, err := conn.Channel()
-	if err != nil {
-		log.Fatalf("Failed to open rabbitmq channel: %v", err)
-	}
-	defer ch.Close()
-	// 声明 Social 交换机和队列
-	if err := declareSocialTopology(ch); err != nil {
-		log.Fatalf("Failed to declare social topology: %v", err)
-	}
-	if err := declareLikeTopology(ch); err != nil {
-		log.Fatalf("Failed to declare like topology: %v", err)
-	}
-	if err := declareCommentTopology(ch); err != nil {
-		log.Fatalf("Failed to declare comment topology: %v", err)
-	}
-	if cache != nil {
-		if err := declarePopularityTopology(ch); err != nil {
-			log.Fatalf("Failed to declare popularity topology: %v", err)
-		}
-	}
-	if err := ch.Qos(50, 0, false); err != nil {
-		log.Fatalf("Failed to set qos: %v", err)
-	}
-
-	repo := social.NewSocialRepository(sqlDB)
-	socialWorker := worker.NewSocialWorker(ch, repo, socialQueue)
-	videoRepo := video.NewVideoRepository(sqlDB)
-	likeRepo := video.NewLikeRepository(sqlDB)
-	commentRepo := video.NewCommentRepository(sqlDB)
-	likeWorker := worker.NewLikeWorker(ch, likeRepo, videoRepo, likeQueue)
-	commentWorker := worker.NewCommentWorker(ch, commentRepo, videoRepo, commentQueue)
-	var popularityWorker *worker.PopularityWorker
-	if cache != nil {
-		popularityWorker = worker.NewPopularityWorker(ch, cache, popularityQueue)
-	}
-
+	defer cache.Close()
+	// Keep the client even if Redis is temporarily unavailable at startup.
+	// Consumers retry failures and preserve exhausted deliveries in the DLX.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-
-	pprofServer, err := observability.NewPprofServer(
-		"Worker",
-		cfg.ObservabilityConfig.Pprof.Enabled,
-		cfg.ObservabilityConfig.Pprof.WorkerAddr,
-	)
+	pool, err := sqlDB.DB()
 	if err != nil {
-		log.Printf("Failed to start worker pprof server: %v", err)
+		log.Fatalf("access SQL pool: %v", err)
 	}
-	if pprofServer != nil {
-		defer pprofServer.Close()
-	}
-
-	errCh := make(chan error, 4)
-	log.Printf("Worker started, consuming queue=%s", socialQueue)
-	go func() { errCh <- socialWorker.Run(ctx) }()
-	log.Printf("Worker started, consuming queue=%s", likeQueue)
-	go func() { errCh <- likeWorker.Run(ctx) }()
-	log.Printf("Worker started, consuming queue=%s", commentQueue)
-	go func() { errCh <- commentWorker.Run(ctx) }()
-	if popularityWorker != nil {
-		log.Printf("Worker started, consuming queue=%s", popularityQueue)
-		go func() { errCh <- popularityWorker.Run(ctx) }()
-	}
-
-	err = <-errCh
-	if err != nil && err != context.Canceled {
-		log.Fatalf("Worker stopped: %v", err)
-	}
-	log.Printf("Worker stopped")
-}
-
-func declareSocialTopology(ch *amqp.Channel) error {
-	if err := ch.ExchangeDeclare(
-		socialExchange,
-		"topic",
-		true,
-		false,
-		false,
-		false,
-		nil,
-	); err != nil {
-		return err
-	}
-
-	q, err := ch.QueueDeclare(
-		socialQueue,
-		true,
-		false,
-		false,
-		false,
-		amqp.Table{"x-dead-letter-exchange": mqrabbit.DLXExchange},
-	)
+	profile, err := observability.NewPprofServer("Worker", cfg.ObservabilityConfig.Pprof.Enabled, cfg.ObservabilityConfig.Pprof.WorkerAddr, pool)
 	if err != nil {
-		return err
+		log.Printf("Worker pprof: %v", err)
 	}
-
-	if err := ch.QueueBind(
-		q.Name,
-		socialBindingKey,
-		socialExchange,
-		false,
-		nil,
-	); err != nil {
-		return err
+	if profile != nil {
+		defer profile.Close()
 	}
-	return nil
-}
-
-func declarePopularityTopology(ch *amqp.Channel) error {
-	if err := ch.ExchangeDeclare(
-		popularityExchange,
-		"topic",
-		true,
-		false,
-		false,
-		false,
-		nil,
-	); err != nil {
-		return err
-	}
-
-	q, err := ch.QueueDeclare(
-		popularityQueue,
-		true,
-		false,
-		false,
-		false,
-		amqp.Table{"x-dead-letter-exchange": mqrabbit.DLXExchange},
-	)
-	if err != nil {
-		return err
-	}
-
-	return ch.QueueBind(
-		q.Name,
-		popularityBindingKey,
-		popularityExchange,
-		false,
-		nil,
-	)
-}
-
-func declareLikeTopology(ch *amqp.Channel) error {
-	if err := ch.ExchangeDeclare(
-		likeExchange,
-		"topic",
-		true,
-		false,
-		false,
-		false,
-		nil,
-	); err != nil {
-		return err
-	}
-
-	q, err := ch.QueueDeclare(
-		likeQueue,
-		true,
-		false,
-		false,
-		false,
-		amqp.Table{"x-dead-letter-exchange": mqrabbit.DLXExchange},
-	)
-	if err != nil {
-		return err
-	}
-
-	return ch.QueueBind(
-		q.Name,
-		likeBindingKey,
-		likeExchange,
-		false,
-		nil,
-	)
-}
-
-func declareCommentTopology(ch *amqp.Channel) error {
-	if err := ch.ExchangeDeclare(
-		commentExchange,
-		"topic",
-		true,
-		false,
-		false,
-		false,
-		nil,
-	); err != nil {
-		return err
-	}
-
-	q, err := ch.QueueDeclare(
-		commentQueue,
-		true,
-		false,
-		false,
-		false,
-		amqp.Table{"x-dead-letter-exchange": mqrabbit.DLXExchange},
-	)
-	if err != nil {
-		return err
-	}
-
-	return ch.QueueBind(
-		q.Name,
-		commentBindingKey,
-		commentExchange,
-		false,
-		nil,
-	)
+	// The outbox dispatcher also runs here: when every API instance is down the
+	// worker must still publish committed interaction events instead of leaving
+	// them stranded in outbox_events. Leases keep the two processes from colliding.
+	publisher := rabbitmq.NewConfirmedPublisher(cfg.RabbitMQ)
+	defer publisher.Close()
+	go (&events.Dispatcher{DB: sqlDB, Publisher: publisher}).Run(ctx)
+	log.Printf("Worker started; consumers reconnect automatically")
+	worker.RunInteractionConsumers(ctx, cfg.RabbitMQ, sqlDB, cache)
 }

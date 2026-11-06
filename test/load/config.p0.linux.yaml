@@ -1,0 +1,22 @@
+server:
+  port: 18088
+database:
+  host: mysql
+  port: 3306
+  user: root
+  password: p0-local-only
+  dbname: p0_loadtest
+redis:
+  host: redis
+  port: 6379
+  db: 0
+rabbitmq:
+  host: rabbitmq
+  port: 5672
+  username: p0
+  password: p0-local-only
+observability:
+  pprof:
+    enabled: true
+    api_addr: 0.0.0.0:16060
+    worker_addr: 0.0.0.0:16061

@@ -6,16 +6,16 @@ import (
 	"errors"
 	"feedsystem_video_go/internal/middleware/rabbitmq"
 	"feedsystem_video_go/internal/social"
-	"log"
 
 	"github.com/go-sql-driver/mysql"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 type SocialWorker struct {
-	ch    *amqp.Channel
-	repo  *social.SocialRepository
-	queue string
+	ch         *amqp.Channel
+	repo       *social.SocialRepository
+	queue      string
+	quarantine func(context.Context, amqp.Delivery) error
 }
 
 func NewSocialWorker(ch *amqp.Channel, repo *social.SocialRepository, queue string) *SocialWorker {
@@ -30,6 +30,11 @@ func (w *SocialWorker) Run(ctx context.Context) error {
 		return errors.New("queue is required")
 	}
 
+	var err error
+	w.quarantine, err = rabbitmq.NewQuarantine(w.ch, w.queue)
+	if err != nil {
+		return err
+	}
 	deliveries, err := w.ch.Consume(
 		w.queue,
 		"",
@@ -51,31 +56,21 @@ func (w *SocialWorker) Run(ctx context.Context) error {
 			if !ok {
 				return errors.New("deliveries channel closed")
 			}
-			w.handleDelivery(ctx, d)
+			if err := w.handleDelivery(ctx, d); err != nil {
+				return err
+			}
 		}
 	}
 }
 
-func (w *SocialWorker) handleDelivery(ctx context.Context, d amqp.Delivery) {
-	if err := w.process(ctx, d.Body); err != nil {
-		retryCount := rabbitmq.GetRetryCount(d)
-		if retryCount >= rabbitmq.MaxRetryCount {
-			log.Printf("social worker: max retries exceeded (%d), moving to DLX: %v", retryCount, err)
-			_ = d.Ack(false)
-			return
-		}
-		log.Printf("social worker: failed (retry %d/%d): %v", retryCount+1, rabbitmq.MaxRetryCount, err)
-		_ = d.Nack(false, true)
-		return
-	}
-	_ = d.Ack(false)
+func (w *SocialWorker) handleDelivery(ctx context.Context, d amqp.Delivery) error {
+	return handleDelivery(ctx, d, func(ctx context.Context) error { return w.process(ctx, d.Body) }, w.quarantine)
 }
 
 func (w *SocialWorker) process(ctx context.Context, body []byte) error {
 	var evt rabbitmq.SocialEvent
 	if err := json.Unmarshal(body, &evt); err != nil {
-		// 解析事件失败，直接丢弃
-		return nil
+		return err
 	}
 	if evt.FollowerID == 0 || evt.VloggerID == 0 {
 		return nil

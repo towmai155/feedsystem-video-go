@@ -33,6 +33,8 @@ func NewMySQL(t testing.TB) *gorm.DB {
 	}
 	cfg.DBName = ""
 	cfg.ParseTime = true
+	// Match the production driver path, including JSON/string parameter encoding.
+	cfg.InterpolateParams = true
 	cfg.Loc = time.UTC
 	cfg.Timeout = 3 * time.Second
 	cfg.ReadTimeout = 5 * time.Second

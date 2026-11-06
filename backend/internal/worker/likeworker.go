@@ -6,16 +6,17 @@ import (
 	"errors"
 	"feedsystem_video_go/internal/middleware/rabbitmq"
 	"feedsystem_video_go/internal/video"
-	"log"
 	amqp "github.com/rabbitmq/amqp091-go"
+	"gorm.io/gorm"
 	"time"
 )
 
 type LikeWorker struct {
-	ch    *amqp.Channel
-	likes  *video.LikeRepository
-	videos *video.VideoRepository
-	queue string
+	ch         *amqp.Channel
+	likes      *video.LikeRepository
+	videos     *video.VideoRepository
+	queue      string
+	quarantine func(context.Context, amqp.Delivery) error
 }
 
 func NewLikeWorker(ch *amqp.Channel, likes *video.LikeRepository, videos *video.VideoRepository, queue string) *LikeWorker {
@@ -30,6 +31,11 @@ func (w *LikeWorker) Run(ctx context.Context) error {
 		return errors.New("queue is required")
 	}
 
+	var err error
+	w.quarantine, err = rabbitmq.NewQuarantine(w.ch, w.queue)
+	if err != nil {
+		return err
+	}
 	deliveries, err := w.ch.Consume(
 		w.queue,
 		"",
@@ -51,33 +57,28 @@ func (w *LikeWorker) Run(ctx context.Context) error {
 			if !ok {
 				return errors.New("deliveries channel closed")
 			}
-			w.handleDelivery(ctx, d)
+			if err := w.handleDelivery(ctx, d); err != nil {
+				return err
+			}
 		}
 	}
 }
 
-func (w *LikeWorker) handleDelivery(ctx context.Context, d amqp.Delivery) {
-	if err := w.process(ctx, d.Body); err != nil {
-		retryCount := rabbitmq.GetRetryCount(d)
-		if retryCount >= rabbitmq.MaxRetryCount {
-			log.Printf("like worker: max retries exceeded (%d), moving to DLX: %v", retryCount, err)
-			_ = d.Ack(false)
-			return
-		}
-		log.Printf("like worker: failed (retry %d/%d): %v", retryCount+1, rabbitmq.MaxRetryCount, err)
-		_ = d.Nack(false, true)
-		return
-	}
-	_ = d.Ack(false)
+func (w *LikeWorker) handleDelivery(ctx context.Context, d amqp.Delivery) error {
+	return handleDelivery(ctx, d, func(ctx context.Context) error { return w.process(ctx, d.Body) }, w.quarantine)
 }
 
 func (w *LikeWorker) process(ctx context.Context, body []byte) error {
 	var evt rabbitmq.LikeEvent
 	if err := json.Unmarshal(body, &evt); err != nil {
-		// 解析事件失败，直接丢弃
-		return nil
+		return err
 	}
 	if evt.UserID == 0 || evt.VideoID == 0 {
+		return nil
+	}
+	// 新一代事件在 HTTP 事务里已经落库，这里只需确认并跳过，避免重复计数。
+	// 旧消息没有该标记，仍按原来的异步落库处理。
+	if evt.Applied {
 		return nil
 	}
 
@@ -92,51 +93,56 @@ func (w *LikeWorker) process(ctx context.Context, body []byte) error {
 }
 
 func (w *LikeWorker) applyLike(ctx context.Context, userID, videoID uint) error {
-	ok, err := w.videos.IsExist(ctx, videoID)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return nil
-	}
+	return w.videos.Transaction(ctx, func(tx *gorm.DB) error {
+		ok, err := w.videos.IsExistTx(tx, videoID)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
 
-	created, err := w.likes.LikeIgnoreDuplicate(ctx, &video.Like{
-		VideoID:   videoID,
-		AccountID: userID,
-		CreatedAt: time.Now(),
+		created, err := w.likes.LikeIgnoreDuplicateTx(tx, &video.Like{
+			VideoID:   videoID,
+			AccountID: userID,
+			CreatedAt: time.Now(),
+		})
+		if err != nil {
+			return err
+		}
+		// The row already exists, so its counters were committed with it.
+		if !created {
+			return nil
+		}
+
+		if err := w.videos.ChangeLikesCountTx(tx, videoID, 1); err != nil {
+			return err
+		}
+		return w.videos.ChangePopularityTx(tx, videoID, 1)
 	})
-	if err != nil {
-		return err
-	}
-	if !created {
-		return nil
-	}
-
-	if err := w.videos.ChangeLikesCount(ctx, videoID, 1); err != nil {
-		return err
-	}
-	return w.videos.ChangePopularity(ctx, videoID, 1)
 }
 
 func (w *LikeWorker) applyUnlike(ctx context.Context, userID, videoID uint) error {
-	ok, err := w.videos.IsExist(ctx, videoID)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return nil
-	}
+	return w.videos.Transaction(ctx, func(tx *gorm.DB) error {
+		ok, err := w.videos.IsExistTx(tx, videoID)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
 
-	deleted, err := w.likes.DeleteByVideoAndAccount(ctx, videoID, userID)
-	if err != nil {
-		return err
-	}
-	if !deleted {
-		return nil
-	}
+		deleted, err := w.likes.DeleteByVideoAndAccountTx(tx, videoID, userID)
+		if err != nil {
+			return err
+		}
+		if !deleted {
+			return nil
+		}
 
-	if err := w.videos.ChangeLikesCount(ctx, videoID, -1); err != nil {
-		return err
-	}
-	return w.videos.ChangePopularity(ctx, videoID, -1)
+		if err := w.videos.ChangeLikesCountTx(tx, videoID, -1); err != nil {
+			return err
+		}
+		return w.videos.ChangePopularityTx(tx, videoID, -1)
+	})
 }

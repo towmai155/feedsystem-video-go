@@ -2,13 +2,14 @@ package feed
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	rediscache "feedsystem_video_go/internal/middleware/redis"
 	"feedsystem_video_go/internal/video"
 	"fmt"
 	"log"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/patrickmn/go-cache"
@@ -31,6 +32,12 @@ type CachedFeedData struct {
 
 func NewFeedService(repo *FeedRepository, likeRepo *video.LikeRepository, rediscache *rediscache.Client) *FeedService {
 	return &FeedService{repo: repo, likeRepo: likeRepo, rediscache: rediscache, localcache: cache.New(3*time.Second, 5*time.Second), cacheTTL: 24 * time.Hour}
+}
+
+// idsDigest 把一批 id 折叠成短摘要，作为 singleflight 的 key，避免 key 过长。
+func idsDigest(ids []uint) string {
+	sum := sha256.Sum256([]byte(fmt.Sprint(ids)))
+	return hex.EncodeToString(sum[:8])
 }
 
 func (f *FeedService) GetVideoByIDs(ctx context.Context, videoIDs []uint) ([]*video.Video, error) {
@@ -102,46 +109,42 @@ func (f *FeedService) GetVideoByIDs(ctx context.Context, videoIDs []uint) ([]*vi
 		return buildOrderedResult(videoIDs, videoMap), nil
 	}
 
-	//L3:MySQL
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	for _, id := range missedL2 {
-		wg.Add(1)
-		go func(videoID uint) {
-			defer wg.Done()
-			sfKey := f.rediscache.Key("sf:entity:%d", videoID)
-
-			v, err, _ := f.requestGroup.Do(sfKey, func() (interface{}, error) {
-				videoList, err := f.repo.GetByIDs(ctx, []uint{videoID})
-
-				if err != nil || len(videoList) == 0 {
-					return nil, err
-				}
-
-				safeCopy := *videoList[0]
-				cachekey := f.rediscache.Key("video:entity:%d", safeCopy.ID)
-				if b, err := json.Marshal(safeCopy); err == nil {
-					//异步回写redis
-					go func(k string, b []byte) {
-						setCtx, setCancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-						defer setCancel()
-
-						f.rediscache.SetBytes(setCtx, k, b, time.Hour)
-					}(cachekey, b)
-				}
-				return videoList[0], err
-			})
-
-			if err == nil && v != nil {
-				safeCopy := *(v.(*video.Video))
-				mu.Lock()
-				videoMap[id] = &safeCopy
-				mu.Unlock()
-				f.localcache.Set(f.rediscache.Key("video:entity:%d", safeCopy.ID), safeCopy, 5*time.Second)
-			}
-		}(id)
+	//L3:MySQL —— 整页一次 IN 查询；缓存穿透时以"缺失 id 集合"做单飞，
+	// 避免过去那种每个 id 一个 goroutine、一次单行查询的写法（一页 20 个视频就是 20 条并发 SQL）。
+	sfKey := f.rediscache.Key("sf:entities:%s", idsDigest(missedL2))
+	loaded, err, _ := f.requestGroup.Do(sfKey, func() (interface{}, error) {
+		return f.repo.GetByIDs(ctx, missedL2)
+	})
+	if err != nil {
+		// 以前这里把查询错误静默吞掉，接口返回空列表掩盖了故障；现在如实上抛。
+		return nil, err
 	}
-	wg.Wait()
+	rows, _ := loaded.([]*video.Video)
+	writeBack := make(map[string][]byte, len(rows))
+	for _, v := range rows {
+		if v == nil {
+			continue
+		}
+		safeCopy := *v
+		videoMap[v.ID] = &safeCopy
+		cacheKey := f.rediscache.Key("video:entity:%d", safeCopy.ID)
+		if f.localcache != nil {
+			f.localcache.Set(cacheKey, safeCopy, 5*time.Second)
+		}
+		if b, err := json.Marshal(safeCopy); err == nil {
+			writeBack[cacheKey] = b
+		}
+	}
+	if len(writeBack) > 0 {
+		// 异步回写 Redis，失败不影响本次响应。
+		go func(items map[string][]byte) {
+			setCtx, setCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer setCancel()
+			for k, b := range items {
+				f.rediscache.SetBytes(setCtx, k, b, time.Hour)
+			}
+		}(writeBack)
+	}
 	return buildOrderedResult(videoIDs, videoMap), nil
 }
 

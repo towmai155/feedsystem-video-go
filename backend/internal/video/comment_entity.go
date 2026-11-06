@@ -9,6 +9,9 @@ type Comment struct {
 	AuthorID  uint      `gorm:"index" json:"author_id"`
 	Content   string    `gorm:"type:text" json:"content"`
 	CreatedAt time.Time `gorm:"autoCreateTime" json:"created_at"`
+	// Legacy (pre-outbox) comment events are applied asynchronously. The unique
+	// index makes a redelivery after a crash a no-op instead of a second comment.
+	EventID *string `gorm:"type:varchar(64);uniqueIndex:idx_comment_event" json:"-"`
 }
 
 type PublishCommentRequest struct {

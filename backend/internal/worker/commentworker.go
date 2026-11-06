@@ -6,17 +6,18 @@ import (
 	"errors"
 	"feedsystem_video_go/internal/middleware/rabbitmq"
 	"feedsystem_video_go/internal/video"
-	"log"
 	"strings"
 
 	amqp "github.com/rabbitmq/amqp091-go"
+	"gorm.io/gorm"
 )
 
 type CommentWorker struct {
-	ch       *amqp.Channel
-	comments *video.CommentRepository
-	videos   *video.VideoRepository
-	queue    string
+	ch         *amqp.Channel
+	comments   *video.CommentRepository
+	videos     *video.VideoRepository
+	queue      string
+	quarantine func(context.Context, amqp.Delivery) error
 }
 
 func NewCommentWorker(ch *amqp.Channel, comments *video.CommentRepository, videos *video.VideoRepository, queue string) *CommentWorker {
@@ -31,6 +32,11 @@ func (w *CommentWorker) Run(ctx context.Context) error {
 		return errors.New("queue is required")
 	}
 
+	var err error
+	w.quarantine, err = rabbitmq.NewQuarantine(w.ch, w.queue)
+	if err != nil {
+		return err
+	}
 	deliveries, err := w.ch.Consume(
 		w.queue,
 		"",
@@ -52,30 +58,21 @@ func (w *CommentWorker) Run(ctx context.Context) error {
 			if !ok {
 				return errors.New("deliveries channel closed")
 			}
-			w.handleDelivery(ctx, d)
+			if err := w.handleDelivery(ctx, d); err != nil {
+				return err
+			}
 		}
 	}
 }
 
-func (w *CommentWorker) handleDelivery(ctx context.Context, d amqp.Delivery) {
-	if err := w.process(ctx, d.Body); err != nil {
-		retryCount := rabbitmq.GetRetryCount(d)
-		if retryCount >= rabbitmq.MaxRetryCount {
-			log.Printf("comment worker: max retries exceeded (%d), moving to DLX: %v", retryCount, err)
-			_ = d.Ack(false)
-			return
-		}
-		log.Printf("comment worker: failed (retry %d/%d): %v", retryCount+1, rabbitmq.MaxRetryCount, err)
-		_ = d.Nack(false, true)
-		return
-	}
-	_ = d.Ack(false)
+func (w *CommentWorker) handleDelivery(ctx context.Context, d amqp.Delivery) error {
+	return handleDelivery(ctx, d, func(ctx context.Context) error { return w.process(ctx, d.Body) }, w.quarantine)
 }
 
 func (w *CommentWorker) process(ctx context.Context, body []byte) error {
 	var evt rabbitmq.CommentEvent
 	if err := json.Unmarshal(body, &evt); err != nil {
-		return nil
+		return err
 	}
 	switch evt.Action {
 	case "publish":
@@ -91,12 +88,8 @@ func (w *CommentWorker) applyPublish(ctx context.Context, evt *rabbitmq.CommentE
 	if evt == nil || evt.VideoID == 0 || evt.AuthorID == 0 || strings.TrimSpace(evt.Content) == "" {
 		return nil
 	}
-
-	ok, err := w.videos.IsExist(ctx, evt.VideoID)
-	if err != nil {
-		return err
-	}
-	if !ok {
+	// 新一代事件已经在 HTTP 事务里写过评论和热度，这里再写一次就会产生重复评论。
+	if evt.Applied {
 		return nil
 	}
 
@@ -106,10 +99,27 @@ func (w *CommentWorker) applyPublish(ctx context.Context, evt *rabbitmq.CommentE
 		AuthorID: evt.AuthorID,
 		Content:  strings.TrimSpace(evt.Content),
 	}
-	if err := w.comments.CreateComment(ctx, c); err != nil {
-		return err
+	if evt.EventID != "" {
+		eventID := evt.EventID
+		c.EventID = &eventID
 	}
-	return w.videos.ChangePopularity(ctx, evt.VideoID, 1)
+	return w.videos.Transaction(ctx, func(tx *gorm.DB) error {
+		ok, err := w.videos.IsExistTx(tx, evt.VideoID)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
+		if err := w.comments.CreateCommentTx(tx, c); err != nil {
+			// 同一事件在提交后、ACK 前被重投：评论和热度已经在第一次事务里写入。
+			if isDuplicateKey(err) {
+				return nil
+			}
+			return err
+		}
+		return w.videos.ChangePopularityTx(tx, evt.VideoID, 1)
+	})
 }
 
 func (w *CommentWorker) applyDelete(ctx context.Context, evt *rabbitmq.CommentEvent) error {
@@ -125,4 +135,3 @@ func (w *CommentWorker) applyDelete(ctx context.Context, evt *rabbitmq.CommentEv
 	}
 	return w.comments.DeleteComment(ctx, c)
 }
-

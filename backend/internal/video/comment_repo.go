@@ -15,7 +15,11 @@ func NewCommentRepository(db *gorm.DB) *CommentRepository {
 }
 
 func (r *CommentRepository) CreateComment(ctx context.Context, comment *Comment) error {
-	return r.db.WithContext(ctx).Create(comment).Error
+	return r.CreateCommentTx(r.db.WithContext(ctx), comment)
+}
+
+func (r *CommentRepository) CreateCommentTx(tx *gorm.DB, comment *Comment) error {
+	return tx.Create(comment).Error
 }
 
 func (r *CommentRepository) DeleteComment(ctx context.Context, comment *Comment) error {

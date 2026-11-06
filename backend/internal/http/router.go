@@ -3,6 +3,7 @@ package http
 import (
 	"context"
 	"feedsystem_video_go/internal/account"
+	"feedsystem_video_go/internal/config"
 	"feedsystem_video_go/internal/feed"
 	"feedsystem_video_go/internal/message"
 	"feedsystem_video_go/internal/middleware/jwt"
@@ -18,7 +19,7 @@ import (
 	"time"
 )
 
-func SetRouter(db *gorm.DB, cache *rediscache.Client, rmq *rabbitmq.RabbitMQ) *gin.Engine {
+func SetRouter(db *gorm.DB, cache *rediscache.Client, rmq *rabbitmq.RabbitMQ, mqConfigs ...*config.RabbitMQConfig) *gin.Engine {
 	r := gin.Default()
 	if err := r.SetTrustedProxies(nil); err != nil {
 		log.Printf("SetTrustedProxies failed: %v", err)
@@ -115,13 +116,8 @@ func SetRouter(db *gorm.DB, cache *rediscache.Client, rmq *rabbitmq.RabbitMQ) *g
 		protectedCommentGroup.POST("/delete", commentLimiter, commentHandler.DeleteComment)
 	}
 	// social
-	socialMQ, err := rabbitmq.NewSocialMQ(rmq)
-	if err != nil {
-		log.Printf("SocialMQ init failed (mq disabled): %v", err)
-		socialMQ = nil
-	}
 	socialRepository := social.NewSocialRepository(db)
-	socialService := social.NewSocialService(socialRepository, accountRepository, socialMQ)
+	socialService := social.NewSocialService(socialRepository, accountRepository)
 	socialHandler := social.NewSocialHandler(socialService)
 	socialGroup := r.Group("/social")
 	protectedSocialGroup := socialGroup.Group("")
@@ -207,33 +203,37 @@ func SetRouter(db *gorm.DB, cache *rediscache.Client, rmq *rabbitmq.RabbitMQ) *g
 	notifGroup.Use(sseHub.SSERequireAuth())
 	sseHub.RegisterRoutes(r, notifGroup)
 
-	go func() {
-		if rmq != nil && rmq.Ch != nil {
-			hub := sseHub
-			ctx := context.Background()
-			// consume from like queue
-			go func() {
-				w := worker.NewNotificationWorker(rmq.Ch, db, "notification.like", hub)
-				if err := w.Run(ctx); err != nil {
-					log.Printf("notification-like worker: %v", err)
+	if len(mqConfigs) > 0 && mqConfigs[0] != nil {
+		go worker.RunNotifications(context.Background(), *mqConfigs[0], db, sseHub)
+	} else {
+		go func() {
+			if rmq != nil && rmq.Ch != nil {
+				hub := sseHub
+				ctx := context.Background()
+				// Each consumer owns its own amqp channel: a single channel shared by
+				// several goroutines is not safe in amqp091 and stalls under load.
+				startNotificationConsumer := func(queue string) {
+					ch, err := rmq.NewChannel()
+					if err != nil {
+						log.Printf("notification channel for %s failed: %v", queue, err)
+						return
+					}
+					if err := ch.Qos(50, 0, false); err != nil {
+						log.Printf("notification qos for %s failed: %v", queue, err)
+					}
+					w := worker.NewNotificationWorker(ch, db, queue, hub)
+					if err := w.Run(ctx); err != nil {
+						log.Printf("notification worker %s: %v", queue, err)
+					}
 				}
-			}()
-			go func() {
-				w := worker.NewNotificationWorker(rmq.Ch, db, "notification.comment", hub)
-				if err := w.Run(ctx); err != nil {
-					log.Printf("notification-comment worker: %v", err)
-				}
-			}()
-			go func() {
-				w := worker.NewNotificationWorker(rmq.Ch, db, "notification.social", hub)
-				if err := w.Run(ctx); err != nil {
-					log.Printf("notification-social worker: %v", err)
-				}
-			}()
-		} else {
-			log.Printf("Notification SSE disabled (MQ not available)")
-		}
-	}()
+				go startNotificationConsumer("notification.like")
+				go startNotificationConsumer("notification.comment")
+				go startNotificationConsumer("notification.social")
+			} else {
+				log.Printf("Notification SSE disabled (MQ not available)")
+			}
+		}()
+	}
 
 	return r
 }

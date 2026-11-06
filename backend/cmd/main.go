@@ -4,11 +4,13 @@ import (
 	"context"
 	"feedsystem_video_go/internal/config"
 	"feedsystem_video_go/internal/db"
+	"feedsystem_video_go/internal/events"
 	apphttp "feedsystem_video_go/internal/http"
 	rabbitmq "feedsystem_video_go/internal/middleware/rabbitmq"
 	rediscache "feedsystem_video_go/internal/middleware/redis"
 	"feedsystem_video_go/internal/observability"
 	"log"
+	"net/http"
 	"os"
 	"strconv"
 	"time"
@@ -77,10 +79,15 @@ func main() {
 		log.Printf("RabbitMQ connected")
 	}
 	// Pprof
+	connectionPool, err := sqlDB.DB()
+	if err != nil {
+		log.Fatalf("Failed to access database pool: %v", err)
+	}
 	pprofServer, err := observability.NewPprofServer(
 		"API",
 		cfg.ObservabilityConfig.Pprof.Enabled,
 		cfg.ObservabilityConfig.Pprof.ApiAddr,
+		connectionPool,
 	)
 	if err != nil {
 		log.Printf("Failed to start API pprof server: %v", err)
@@ -90,9 +97,25 @@ func main() {
 	}
 
 	// 设置路由
-	r := apphttp.SetRouter(sqlDB, cache, rmq)
+	r := apphttp.SetRouter(sqlDB, cache, rmq, &cfg.RabbitMQ)
+	outboxCtx, stopOutbox := context.WithCancel(context.Background())
+	publisher := rabbitmq.NewConfirmedPublisher(cfg.RabbitMQ)
+	defer func() { stopOutbox(); publisher.Close() }()
+	go (&events.Dispatcher{DB: sqlDB, Publisher: publisher}).Run(outboxCtx)
+
+	// 显式构造 http.Server，补上 gin 默认引擎缺的头部/空闲超时：
+	// 慢客户端或半死连接否则会一直占着 goroutine 和连接。
+	// 注意不能设 WriteTimeout——/notification/stream 是长连接 SSE，
+	// 写超时到点会直接掐断事件流。
+	srv := &http.Server{
+		Addr:              ":" + strconv.Itoa(cfg.Server.Port),
+		Handler:           r,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	log.Printf("Server is running on port %d", cfg.Server.Port)
-	if err := r.Run(":" + strconv.Itoa(cfg.Server.Port)); err != nil {
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("Failed to run server: %v", err)
 	}
 }

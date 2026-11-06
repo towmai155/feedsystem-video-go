@@ -25,6 +25,9 @@ type LikeEvent struct {
 	UserID     uint      `json:"user_id"`
 	VideoID    uint      `json:"video_id"`
 	OccurredAt time.Time `json:"occurred_at"`
+	// Applied 表示点赞/取消已经由 HTTP 请求同步写入 MySQL。
+	// 消费者据此跳过重复落库，只保留通知等副作用；旧消息该字段为 false，仍走原来的异步落库。
+	Applied bool `json:"applied,omitempty"`
 }
 
 func NewLikeMQ(base *RabbitMQ) (*LikeMQ, error) {
@@ -62,6 +65,7 @@ func (l *LikeMQ) publish(ctx context.Context, action, routingKey string, userID,
 		UserID:     userID,
 		VideoID:    videoID,
 		OccurredAt: time.Now(),
+		Applied:    true,
 	}
 	return l.PublishJSON(ctx, likeExchange, routingKey, event)
 }

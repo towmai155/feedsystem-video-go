@@ -20,10 +20,18 @@ type Client struct {
 const defaultKeyPrefix = "v1:"
 
 func NewFromEnv(cfg *config.RedisConfig) (*Client, error) {
+	// 显式设置池与网络超时，使不同机器的资源预算一致。
 	rdb := redis.NewClient(&redis.Options{
-		Addr:     cfg.Host + ":" + strconv.Itoa(cfg.Port),
-		Password: cfg.Password,
-		DB:       cfg.DB,
+		Addr:            cfg.Host + ":" + strconv.Itoa(cfg.Port),
+		Password:        cfg.Password,
+		DB:              cfg.DB,
+		PoolSize:        64,
+		MinIdleConns:    8,
+		DialTimeout:     2 * time.Second,
+		ReadTimeout:     time.Second,
+		WriteTimeout:    time.Second,
+		PoolTimeout:     2 * time.Second,
+		ConnMaxIdleTime: 5 * time.Minute,
 	})
 	return &Client{rdb: rdb, keyPrefix: defaultKeyPrefix}, nil
 }

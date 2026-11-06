@@ -9,6 +9,7 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type LikeService struct {
@@ -23,6 +24,12 @@ func NewLikeService(repo *LikeRepository, videoRepo *VideoRepository, cache *red
 	return &LikeService{repo: repo, VideoRepo: videoRepo, cache: cache, likeMQ: likeMQ, popularityMQ: popularityMQ}
 }
 
+// 幂等语义：重复点赞 / 重复取消不是错误，handler 据此返回 200 而不是 500。
+var (
+	ErrAlreadyLiked = errors.New("user has liked this video")
+	ErrNotLiked     = errors.New("user has not liked this video")
+)
+
 func isDupKey(err error) bool {
 	var me *mysql.MySQLError
 	return errors.As(err, &me) && me.Number == 1062
@@ -36,72 +43,47 @@ func (s *LikeService) Like(ctx context.Context, like *Like) error {
 		return errors.New("video_id and account_id are required")
 	}
 
-	if s.VideoRepo != nil {
-		ok, err := s.VideoRepo.IsExist(ctx, like.VideoID)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return errors.New("video not found")
-		}
-	}
-
-	isLiked, err := s.repo.IsLiked(ctx, like.VideoID, like.AccountID)
+	like.CreatedAt = time.Now()
+	release, err := interactionWrites.acquire(ctx, like.VideoID)
 	if err != nil {
 		return err
 	}
-	if isLiked {
-		return errors.New("user has liked this video")
-	}
+	defer release()
 
-	like.CreatedAt = time.Now()
-	mysqlEnqueued := false
-	redisEnqueued := false
-	if s.likeMQ != nil {
-		if err := s.likeMQ.Like(ctx, like.AccountID, like.VideoID); err == nil {
-			mysqlEnqueued = true
-		}
-	}
-	if s.popularityMQ != nil {
-		if err := s.popularityMQ.Update(ctx, like.VideoID, 1); err == nil {
-			redisEnqueued = true
-		}
-	}
-	if mysqlEnqueued && redisEnqueued {
-		return nil
-	}
-
-	// Fallback: direct MySQL write when like MQ publish fails.
-	if !mysqlEnqueued {
-		err := s.repo.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			if err := tx.Select("id").First(&Video{}, like.VideoID).Error; err != nil {
-				if errors.Is(err, gorm.ErrRecordNotFound) {
-					return errors.New("video not found")
-				}
-				return err
+	// 先在一个事务里把"点赞行 + 计数"落库：唯一索引 (video_id, account_id) 负责去重，
+	// ON DUPLICATE KEY UPDATE 让并发重复点赞只有一次生效，不再依赖先查后写的竞态。
+	err = s.repo.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Select("id").First(&Video{}, like.VideoID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errors.New("video not found")
 			}
-			if err := tx.Create(like).Error; err != nil {
-				if isDupKey(err) {
-					return errors.New("user has liked this video")
-				}
-				return err
-			}
-			if err := tx.Model(&Video{}).Where("id = ?", like.VideoID).
-				UpdateColumn("likes_count", gorm.Expr("likes_count + 1")).Error; err != nil {
-				return err
-			}
-			return tx.Model(&Video{}).Where("id = ?", like.VideoID).
-				UpdateColumn("popularity", gorm.Expr("popularity + 1")).Error
-		})
-		if err != nil {
 			return err
 		}
+		res := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(like)
+		if res.Error != nil {
+			if isDupKey(res.Error) {
+				return ErrAlreadyLiked
+			}
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return ErrAlreadyLiked
+		}
+		if err := enqueueLike(tx, like, "like", 1); err != nil {
+			return err
+		}
+		return tx.Model(&Video{}).Where("id = ?", like.VideoID).
+			Updates(map[string]any{
+				"likes_count": gorm.Expr("likes_count + 1"),
+				"popularity":  gorm.Expr("popularity + 1"),
+			}).Error
+	})
+	if err != nil {
+		return err
 	}
 
-	// Fallback: direct Redis update when popularity MQ publish fails.
-	if !redisEnqueued {
-		UpdatePopularityCache(ctx, s.cache, like.VideoID, 1)
-	}
+	// The transaction also persisted both events. Publication is retried by the
+	// outbox dispatcher independently of this request or broker availability.
 	return nil
 }
 
@@ -112,68 +94,35 @@ func (s *LikeService) Unlike(ctx context.Context, like *Like) error {
 	if like.VideoID == 0 || like.AccountID == 0 {
 		return errors.New("video_id and account_id are required")
 	}
-
-	if s.VideoRepo != nil {
-		ok, err := s.VideoRepo.IsExist(ctx, like.VideoID)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return errors.New("video not found")
-		}
-	}
-
-	isLiked, err := s.repo.IsLiked(ctx, like.VideoID, like.AccountID)
+	release, err := interactionWrites.acquire(ctx, like.VideoID)
 	if err != nil {
 		return err
 	}
-	if !isLiked {
-		return errors.New("user has not liked this video")
-	}
+	defer release()
 
-	mysqlEnqueued := false
-	redisEnqueued := false
-	if s.likeMQ != nil {
-		if err := s.likeMQ.Unlike(ctx, like.AccountID, like.VideoID); err == nil {
-			mysqlEnqueued = true
+	// 同样先落库再发事件：删除行与减计数在同一事务内完成，
+	// 并发的重复取消只会有一次真正删除成功。
+	err = s.repo.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		del := tx.Where("video_id = ? AND account_id = ?", like.VideoID, like.AccountID).Delete(&Like{})
+		if del.Error != nil {
+			return del.Error
 		}
-	}
-	if s.popularityMQ != nil {
-		if err := s.popularityMQ.Update(ctx, like.VideoID, -1); err == nil {
-			redisEnqueued = true
+		if del.RowsAffected == 0 {
+			return ErrNotLiked
 		}
-	}
-	if mysqlEnqueued && redisEnqueued {
-		return nil
-	}
-
-	// Fallback: direct MySQL write when like MQ publish fails.
-	if !mysqlEnqueued {
-		err := s.repo.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			del := tx.Where("video_id = ? AND account_id = ?", like.VideoID, like.AccountID).Delete(&Like{})
-			if del.Error != nil {
-				return del.Error
-			}
-			if del.RowsAffected == 0 {
-				return errors.New("user has not liked this video")
-			}
-
-			if err := tx.Model(&Video{}).Where("id = ?", like.VideoID).
-				UpdateColumn("likes_count", gorm.Expr("GREATEST(likes_count - 1, 0)")).Error; err != nil {
-				return err
-			}
-			return tx.Model(&Video{}).Where("id = ?", like.VideoID).
-				UpdateColumn("popularity", gorm.Expr("GREATEST(popularity - 1, 0)")).Error
-		})
-		if err != nil {
+		if err := enqueueLike(tx, like, "unlike", -1); err != nil {
 			return err
 		}
+		return tx.Model(&Video{}).Where("id = ?", like.VideoID).
+			Updates(map[string]any{
+				"likes_count": gorm.Expr("GREATEST(likes_count - 1, 0)"),
+				"popularity":  gorm.Expr("GREATEST(popularity - 1, 0)"),
+			}).Error
+	})
+	if err != nil {
+		return err
 	}
 
-	// Fallback: direct Redis update when popularity MQ publish fails.
-	if !redisEnqueued {
-		UpdatePopularityCache(ctx, s.cache, like.VideoID, -1)
-	}
 	return nil
 }
 

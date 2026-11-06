@@ -27,10 +27,14 @@ func (r *LikeRepository) Unlike(ctx context.Context, like *Like) error {
 }
 
 func (r *LikeRepository) LikeIgnoreDuplicate(ctx context.Context, like *Like) (created bool, err error) {
+	return r.LikeIgnoreDuplicateTx(r.db.WithContext(ctx), like)
+}
+
+func (r *LikeRepository) LikeIgnoreDuplicateTx(tx *gorm.DB, like *Like) (created bool, err error) {
 	if like == nil || like.VideoID == 0 || like.AccountID == 0 {
 		return false, nil
 	}
-	err = r.db.WithContext(ctx).Create(like).Error
+	err = tx.Create(like).Error
 	if err == nil {
 		return true, nil
 	}
@@ -42,11 +46,14 @@ func (r *LikeRepository) LikeIgnoreDuplicate(ctx context.Context, like *Like) (c
 }
 
 func (r *LikeRepository) DeleteByVideoAndAccount(ctx context.Context, videoID, accountID uint) (deleted bool, err error) {
+	return r.DeleteByVideoAndAccountTx(r.db.WithContext(ctx), videoID, accountID)
+}
+
+func (r *LikeRepository) DeleteByVideoAndAccountTx(tx *gorm.DB, videoID, accountID uint) (deleted bool, err error) {
 	if videoID == 0 || accountID == 0 {
 		return false, nil
 	}
-	res := r.db.WithContext(ctx).
-		Where("video_id = ? AND account_id = ?", videoID, accountID).
+	res := tx.Where("video_id = ? AND account_id = ?", videoID, accountID).
 		Delete(&Like{})
 	return res.RowsAffected > 0, res.Error
 }

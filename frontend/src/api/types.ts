@@ -1,4 +1,10 @@
-export type MessageResponse = { message: string }
+export type MessageResponse = {
+  message: string
+  /** 点赞幂等：服务端认为「已点过」，本次没有新增点赞记录，计数不应再 +1 */
+  already_liked?: boolean
+  /** 取消点赞幂等：服务端认为「本来就没点过」，计数不应再 -1 */
+  already_unliked?: boolean
+}
 
 export type DirectMessage = {
   id: number

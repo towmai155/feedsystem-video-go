@@ -45,4 +45,7 @@ type OutboxMsg struct {
 	EventType  string    `gorm:"type:varchar(50)"`
 	CreateTime time.Time `gorm:"autoCreateTime"`
 	Status     string    `gorm:"type:varchar(50);index"`
+	// ClaimedAt marks who currently owns a "sending" row so a crashed poller can
+	// be distinguished from one that is merely slow.
+	ClaimedAt *time.Time `gorm:"index"`
 }

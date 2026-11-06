@@ -1,0 +1,44 @@
+# Overlay for the Linux API/Worker comparison. No runtime image download is
+# needed: the existing Redis Alpine image runs the statically linked binaries.
+x-process: &process
+  image: redis:7-alpine
+  working_dir: /workspace/backend
+  volumes:
+    - ../..:/workspace:ro
+    - ${P0_ZONEINFO:?Set P0_ZONEINFO to Go zoneinfo.zip}:/zoneinfo.zip:ro
+  environment:
+    TZ: Asia/Shanghai
+    ZONEINFO: /zoneinfo.zip
+    CONFIG_PATH: /workspace/test/load/config.p0.linux.yaml
+    GIN_MODE: release
+    JWT_SECRET: p0-benchmark-isolated-local-signing-key
+    MYSQL_HOST: mysql
+    MYSQL_PORT: 3306
+    MYSQL_USER: root
+    MYSQL_PASSWORD: p0-local-only
+    MYSQL_DATABASE: p0_loadtest
+    REDIS_HOST: redis
+    REDIS_PORT: 6379
+    RABBITMQ_HOST: rabbitmq
+    RABBITMQ_PORT: 5672
+    RABBITMQ_USER: p0
+    RABBITMQ_PASS: p0-local-only
+  depends_on:
+    mysql:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    rabbitmq:
+      condition: service_healthy
+services:
+  api:
+    <<: *process
+    entrypoint: [/workspace/backend/.run/p0/linux/api]
+    ports:
+      - 127.0.0.1:18088:18088
+      - 127.0.0.1:16060:16060
+  worker:
+    <<: *process
+    entrypoint: [/workspace/backend/.run/p0/linux/worker]
+    ports:
+      - 127.0.0.1:16061:16061
