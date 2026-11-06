@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"feedsystem_video_go/internal/account"
+	"feedsystem_video_go/internal/dbretry"
 	"feedsystem_video_go/internal/events"
 	"feedsystem_video_go/internal/middleware/rabbitmq"
 
@@ -45,15 +46,18 @@ func (s *SocialService) Follow(ctx context.Context, social *Social) error {
 	if isFollowed {
 		return errors.New("already followed")
 	}
-	return s.repo.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Create(social).Error; err != nil {
-			// 并发重复关注：唯一索引兜底，按幂等语义返回。
-			if isDuplicateKey(err) {
-				return errors.New("already followed")
+	return dbretry.Run(ctx, func() error {
+		social.ID = 0
+		return s.repo.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			if err := tx.Create(social).Error; err != nil {
+				// 并发重复关注：唯一索引兜底，按幂等语义返回。
+				if isDuplicateKey(err) {
+					return errors.New("already followed")
+				}
+				return err
 			}
-			return err
-		}
-		return enqueueSocialEvent(tx, "follow", social)
+			return enqueueSocialEvent(tx, "follow", social)
+		})
 	})
 }
 
@@ -73,17 +77,19 @@ func (s *SocialService) Unfollow(ctx context.Context, social *Social) error {
 	if !isFollowed {
 		return errors.New("not followed")
 	}
-	return s.repo.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		res := tx.Where("follower_id = ? AND vlogger_id = ?", social.FollowerID, social.VloggerID).
-			Delete(&Social{})
-		if res.Error != nil {
-			return res.Error
-		}
-		if res.RowsAffected == 0 {
-			// 并发取消关注，另一请求已经把关系删掉了。
-			return errors.New("not followed")
-		}
-		return enqueueSocialEvent(tx, "unfollow", social)
+	return dbretry.Run(ctx, func() error {
+		return s.repo.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			res := tx.Where("follower_id = ? AND vlogger_id = ?", social.FollowerID, social.VloggerID).
+				Delete(&Social{})
+			if res.Error != nil {
+				return res.Error
+			}
+			if res.RowsAffected == 0 {
+				// 并发取消关注，另一请求已经把关系删掉了。
+				return errors.New("not followed")
+			}
+			return enqueueSocialEvent(tx, "unfollow", social)
+		})
 	})
 }
 

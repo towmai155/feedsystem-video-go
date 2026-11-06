@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"feedsystem_video_go/internal/apierror"
+	"feedsystem_video_go/internal/dbretry"
 	"feedsystem_video_go/internal/events"
 	"feedsystem_video_go/internal/middleware/rabbitmq"
 	rediscache "feedsystem_video_go/internal/middleware/redis"
@@ -46,27 +47,31 @@ func (s *CommentService) Publish(ctx context.Context, comment *Comment) error {
 
 	// 评论、热度事件、@mention 通知在同一个事务里落库，提交后由 outbox
 	// dispatcher 负责投递。HTTP 返回时评论一定可见，且不会出现"评论成功但
-	// 事件/通知丢失"的部分提交。
-	err = s.repo.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Select("id").First(&Video{}, comment.VideoID).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return errors.New("video not found")
+	// 事件/通知丢失"的部分提交。并发评论偶尔会被 InnoDB 判为死锁（1213），
+	// 整笔事务已回滚，清掉试写留下的主键后重跑即可。
+	err = dbretry.Run(ctx, func() error {
+		comment.ID = 0
+		return s.repo.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			if err := tx.Select("id").First(&Video{}, comment.VideoID).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return errors.New("video not found")
+				}
+				return err
 			}
-			return err
-		}
-		if err := tx.Create(comment).Error; err != nil {
-			return err
-		}
-		if err := enqueueComment(tx, comment); err != nil {
-			return err
-		}
-		// @mention 通知和评论同事务：提交成功的评论不会丢 mention，
-		// 插入失败则整体回滚，避免出现"评论已可见但通知永远没发"。
-		if err := enqueueMentions(tx, comment); err != nil {
-			return err
-		}
-		return tx.Model(&Video{}).Where("id = ?", comment.VideoID).
-			UpdateColumn("popularity", gorm.Expr("popularity + 1")).Error
+			if err := tx.Create(comment).Error; err != nil {
+				return err
+			}
+			if err := enqueueComment(tx, comment); err != nil {
+				return err
+			}
+			// @mention 通知和评论同事务：提交成功的评论不会丢 mention，
+			// 插入失败则整体回滚，避免出现"评论已可见但通知永远没发"。
+			if err := enqueueMentions(tx, comment); err != nil {
+				return err
+			}
+			return tx.Model(&Video{}).Where("id = ?", comment.VideoID).
+				UpdateColumn("popularity", gorm.Expr("popularity + 1")).Error
+		})
 	})
 	if err != nil {
 		return err

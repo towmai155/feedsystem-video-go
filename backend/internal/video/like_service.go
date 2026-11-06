@@ -3,6 +3,7 @@ package video
 import (
 	"context"
 	"errors"
+	"feedsystem_video_go/internal/dbretry"
 	"feedsystem_video_go/internal/middleware/rabbitmq"
 	rediscache "feedsystem_video_go/internal/middleware/redis"
 	"time"
@@ -52,31 +53,36 @@ func (s *LikeService) Like(ctx context.Context, like *Like) error {
 
 	// 先在一个事务里把"点赞行 + 计数"落库：唯一索引 (video_id, account_id) 负责去重，
 	// ON DUPLICATE KEY UPDATE 让并发重复点赞只有一次生效，不再依赖先查后写的竞态。
-	err = s.repo.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Select("id").First(&Video{}, like.VideoID).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return errors.New("video not found")
+	// 同一个视频上的并发事务偶尔会被 InnoDB 判为死锁（1213），整笔事务已经回滚，
+	// 直接重跑即可；重跑前清掉上次试写留下的自增主键。
+	err = dbretry.Run(ctx, func() error {
+		like.ID = 0
+		return s.repo.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			if err := tx.Select("id").First(&Video{}, like.VideoID).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return errors.New("video not found")
+				}
+				return err
 			}
-			return err
-		}
-		res := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(like)
-		if res.Error != nil {
-			if isDupKey(res.Error) {
+			res := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(like)
+			if res.Error != nil {
+				if isDupKey(res.Error) {
+					return ErrAlreadyLiked
+				}
+				return res.Error
+			}
+			if res.RowsAffected == 0 {
 				return ErrAlreadyLiked
 			}
-			return res.Error
-		}
-		if res.RowsAffected == 0 {
-			return ErrAlreadyLiked
-		}
-		if err := enqueueLike(tx, like, "like", 1); err != nil {
-			return err
-		}
-		return tx.Model(&Video{}).Where("id = ?", like.VideoID).
-			Updates(map[string]any{
-				"likes_count": gorm.Expr("likes_count + 1"),
-				"popularity":  gorm.Expr("popularity + 1"),
-			}).Error
+			if err := enqueueLike(tx, like, "like", 1); err != nil {
+				return err
+			}
+			return tx.Model(&Video{}).Where("id = ?", like.VideoID).
+				Updates(map[string]any{
+					"likes_count": gorm.Expr("likes_count + 1"),
+					"popularity":  gorm.Expr("popularity + 1"),
+				}).Error
+		})
 	})
 	if err != nil {
 		return err
@@ -102,22 +108,24 @@ func (s *LikeService) Unlike(ctx context.Context, like *Like) error {
 
 	// 同样先落库再发事件：删除行与减计数在同一事务内完成，
 	// 并发的重复取消只会有一次真正删除成功。
-	err = s.repo.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		del := tx.Where("video_id = ? AND account_id = ?", like.VideoID, like.AccountID).Delete(&Like{})
-		if del.Error != nil {
-			return del.Error
-		}
-		if del.RowsAffected == 0 {
-			return ErrNotLiked
-		}
-		if err := enqueueLike(tx, like, "unlike", -1); err != nil {
-			return err
-		}
-		return tx.Model(&Video{}).Where("id = ?", like.VideoID).
-			Updates(map[string]any{
-				"likes_count": gorm.Expr("GREATEST(likes_count - 1, 0)"),
-				"popularity":  gorm.Expr("GREATEST(popularity - 1, 0)"),
-			}).Error
+	err = dbretry.Run(ctx, func() error {
+		return s.repo.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			del := tx.Where("video_id = ? AND account_id = ?", like.VideoID, like.AccountID).Delete(&Like{})
+			if del.Error != nil {
+				return del.Error
+			}
+			if del.RowsAffected == 0 {
+				return ErrNotLiked
+			}
+			if err := enqueueLike(tx, like, "unlike", -1); err != nil {
+				return err
+			}
+			return tx.Model(&Video{}).Where("id = ?", like.VideoID).
+				Updates(map[string]any{
+					"likes_count": gorm.Expr("GREATEST(likes_count - 1, 0)"),
+					"popularity":  gorm.Expr("GREATEST(popularity - 1, 0)"),
+				}).Error
+		})
 	})
 	if err != nil {
 		return err
