@@ -10,7 +10,7 @@ import (
 )
 
 func TestVideoWriteGateBoundsWritersAndReleasesEntries(t *testing.T) {
-	gate := newVideoWriteGate(globalWriteConcurrency)
+	gate := newVideoWriteGate(globalWriteConcurrency, perVideoWriteConcurrency)
 	var wg sync.WaitGroup
 	var active atomic.Int32
 	for i := 0; i < 100; i++ {
@@ -39,7 +39,7 @@ func TestVideoWriteGateBoundsWritersAndReleasesEntries(t *testing.T) {
 }
 
 func TestVideoWriteGateCancellationAndIndependentVideos(t *testing.T) {
-	gate := newVideoWriteGate(perVideoWriteConcurrency * 2)
+	gate := newVideoWriteGate(perVideoWriteConcurrency*2, perVideoWriteConcurrency)
 	releases := make([]func(), 0, perVideoWriteConcurrency)
 	for i := 0; i < perVideoWriteConcurrency; i++ {
 		release, err := gate.acquire(context.Background(), 7)
@@ -67,7 +67,7 @@ func TestVideoWriteGateCancellationAndIndependentVideos(t *testing.T) {
 }
 
 func TestVideoWriteGateCapsTotalWritersAcrossVideos(t *testing.T) {
-	gate := newVideoWriteGate(2)
+	gate := newVideoWriteGate(2, perVideoWriteConcurrency)
 	first, err := gate.acquire(context.Background(), 1)
 	if err != nil {
 		t.Fatal(err)

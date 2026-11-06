@@ -20,9 +20,10 @@ import (
 // transactions below the connection pool so authentication and reads keep
 // their connections.
 type videoWriteGate struct {
-	global  chan struct{}
-	mu      sync.Mutex
-	entries map[uint]*videoWriteEntry
+	global   chan struct{}
+	perVideo int
+	mu       sync.Mutex
+	entries  map[uint]*videoWriteEntry
 }
 
 type videoWriteEntry struct {
@@ -38,7 +39,7 @@ var (
 	perVideoWriteConcurrency = intFromEnv("WRITE_GATE_PER_VIDEO", 16)
 	globalWriteConcurrency   = intFromEnv("WRITE_GATE_GLOBAL", 32)
 
-	interactionWrites = newVideoWriteGate(globalWriteConcurrency)
+	interactionWrites = newVideoWriteGate(globalWriteConcurrency, perVideoWriteConcurrency)
 )
 
 func intFromEnv(name string, fallback int) int {
@@ -54,10 +55,11 @@ func intFromEnv(name string, fallback int) int {
 	return value
 }
 
-func newVideoWriteGate(global int) videoWriteGate {
+func newVideoWriteGate(global, perVideo int) videoWriteGate {
 	return videoWriteGate{
-		global:  make(chan struct{}, global),
-		entries: make(map[uint]*videoWriteEntry),
+		global:   make(chan struct{}, global),
+		perVideo: perVideo,
+		entries:  make(map[uint]*videoWriteEntry),
 	}
 }
 
@@ -71,7 +73,7 @@ func (g *videoWriteGate) acquire(ctx context.Context, id uint) (func(), error) {
 	}
 	e := g.entries[id]
 	if e == nil {
-		e = &videoWriteEntry{token: make(chan struct{}, perVideoWriteConcurrency)}
+		e = &videoWriteEntry{token: make(chan struct{}, g.perVideo)}
 		g.entries[id] = e
 	}
 	e.users++
