@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-func SetRouter(db *gorm.DB, cache *rediscache.Client, rmq *rabbitmq.RabbitMQ, mqConfigs ...*config.RabbitMQConfig) *gin.Engine {
+func SetRouter(db *gorm.DB, sessionDB *gorm.DB, cache *rediscache.Client, rmq *rabbitmq.RabbitMQ, mqConfigs ...*config.RabbitMQConfig) *gin.Engine {
 	r := gin.Default()
 	if err := r.SetTrustedProxies(nil); err != nil {
 		log.Printf("SetTrustedProxies failed: %v", err)
@@ -34,8 +34,12 @@ func SetRouter(db *gorm.DB, cache *rediscache.Client, rmq *rabbitmq.RabbitMQ, mq
 	socialLimiter := ratelimit.Limit(cache, "social_write", 20, time.Minute, ratelimit.KeyByAccount)
 
 	// account
+	if sessionDB == nil {
+		sessionDB = db
+	}
 	accountRepository := account.NewAccountRepository(db)
-	sessionValidator := account.NewSessionValidator(accountRepository)
+	// 会话校验走独立小池：写入/读流量再大也不会把鉴权的连接抢光。
+	sessionValidator := account.NewSessionValidator(account.NewAccountRepository(sessionDB))
 	sseHub := worker.NewSSEHub(db, sessionValidator)
 	accountService := account.NewAccountService(accountRepository, sseHub.DisconnectSession)
 	accountHandler := account.NewAccountHandler(accountService)

@@ -149,5 +149,9 @@ npm run build
 | `MYSQL_ROOT_PASSWORD` | `123456` | MySQL root 密码 |
 | `REDIS_PASSWORD` | `123456` | Redis 密码 |
 | `RABBITMQ_USER` / `RABBITMQ_PASS` | `admin` / `password123` | RabbitMQ 账号 |
+| `MYSQL_MAX_OPEN_CONNS` | `64` | 主连接池上限（每进程） |
+| `MYSQL_SESSION_MAX_OPEN_CONNS` | `16` | 会话校验专用小池上限，与主池隔离，写突发时鉴权不断连接 |
+| `WRITE_GATE_PER_VIDEO` | `16` | 单个视频同时进行中的互动写（每进程） |
+| `WRITE_GATE_GLOBAL` | `32` | 全部互动写的同时进行上限（每进程），须小于等于连接池预算 |
 
 详见 `.env.example`。

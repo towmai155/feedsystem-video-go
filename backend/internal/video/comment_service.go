@@ -52,12 +52,6 @@ func (s *CommentService) Publish(ctx context.Context, comment *Comment) error {
 	err = dbretry.Run(ctx, func() error {
 		comment.ID = 0
 		return s.repo.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			if err := tx.Select("id").First(&Video{}, comment.VideoID).Error; err != nil {
-				if errors.Is(err, gorm.ErrRecordNotFound) {
-					return errors.New("video not found")
-				}
-				return err
-			}
 			if err := tx.Create(comment).Error; err != nil {
 				return err
 			}
@@ -69,8 +63,18 @@ func (s *CommentService) Publish(ctx context.Context, comment *Comment) error {
 			if err := enqueueMentions(tx, comment); err != nil {
 				return err
 			}
-			return tx.Model(&Video{}).Where("id = ?", comment.VideoID).
-				UpdateColumn("popularity", gorm.Expr("popularity + 1")).Error
+			// 放在最后：这条 UPDATE 本身就要求视频行存在，用影响行数判断 404，
+			// 就省掉了原先那条单独的 SELECT（视频不存在时整体回滚，不留下评论）。
+			// 顺序与原来一致，热度行的锁只在事务末尾短暂持有。
+			upd := tx.Model(&Video{}).Where("id = ?", comment.VideoID).
+				UpdateColumn("popularity", gorm.Expr("popularity + 1"))
+			if upd.Error != nil {
+				return upd.Error
+			}
+			if upd.RowsAffected == 0 {
+				return errors.New("video not found")
+			}
+			return nil
 		})
 	})
 	if err != nil {

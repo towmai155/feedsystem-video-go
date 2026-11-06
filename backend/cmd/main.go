@@ -51,6 +51,13 @@ func main() {
 	}
 	defer db.CloseDB(sqlDB)
 
+	// 会话校验专用小连接池：与主池隔离，写入突发时鉴权仍能拿到连接。
+	sessionDB, err := db.NewSessionDB(cfg.Database)
+	if err != nil {
+		log.Fatalf("Failed to open session database pool: %v", err)
+	}
+	defer db.CloseDB(sessionDB)
+
 	// 连接 Redis (可选，用于缓存)
 	cache, err := rediscache.NewFromEnv(&cfg.Redis)
 	if err != nil {
@@ -97,7 +104,7 @@ func main() {
 	}
 
 	// 设置路由
-	r := apphttp.SetRouter(sqlDB, cache, rmq, &cfg.RabbitMQ)
+	r := apphttp.SetRouter(sqlDB, sessionDB, cache, rmq, &cfg.RabbitMQ)
 	outboxCtx, stopOutbox := context.WithCancel(context.Background())
 	publisher := rabbitmq.NewConfirmedPublisher(cfg.RabbitMQ)
 	defer func() { stopOutbox(); publisher.Close() }()

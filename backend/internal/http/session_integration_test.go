@@ -39,7 +39,7 @@ func sessionRouter(t *testing.T, cache *rediscache.Client) (*gin.Engine, *gorm.D
 	if err := account.NewAccountRepository(db).CreateAccount(context.Background(), &account.Account{Username: "tester", Password: string(hash)}); err != nil {
 		t.Fatal(err)
 	}
-	return apphttp.SetRouter(db, cache, nil), db
+	return apphttp.SetRouter(db, nil, cache, nil), db
 }
 
 func postAccount(t *testing.T, router *gin.Engine, path, token string, body any) *httptest.ResponseRecorder {

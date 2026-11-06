@@ -58,12 +58,6 @@ func (s *LikeService) Like(ctx context.Context, like *Like) error {
 	err = dbretry.Run(ctx, func() error {
 		like.ID = 0
 		return s.repo.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			if err := tx.Select("id").First(&Video{}, like.VideoID).Error; err != nil {
-				if errors.Is(err, gorm.ErrRecordNotFound) {
-					return errors.New("video not found")
-				}
-				return err
-			}
 			res := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(like)
 			if res.Error != nil {
 				if isDupKey(res.Error) {
@@ -77,11 +71,20 @@ func (s *LikeService) Like(ctx context.Context, like *Like) error {
 			if err := enqueueLike(tx, like, "like", 1); err != nil {
 				return err
 			}
-			return tx.Model(&Video{}).Where("id = ?", like.VideoID).
+			// 不再单独 SELECT 一次视频：计数器更新自身就要求视频行存在，
+			// 用它的影响行数判断 404，省掉一条语句和一次行锁。
+			upd := tx.Model(&Video{}).Where("id = ?", like.VideoID).
 				Updates(map[string]any{
 					"likes_count": gorm.Expr("likes_count + 1"),
 					"popularity":  gorm.Expr("popularity + 1"),
-				}).Error
+				})
+			if upd.Error != nil {
+				return upd.Error
+			}
+			if upd.RowsAffected == 0 {
+				return errors.New("video not found")
+			}
+			return nil
 		})
 	})
 	if err != nil {
